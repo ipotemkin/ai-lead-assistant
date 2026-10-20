@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI-помощник по обработке заявок</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="head">
+      <div class="head-text">
+        <h1>AI-помощник по обработке заявок</h1>
+        <p class="lead">
+          Вставьте текст заявки — помощник вытащит данные, определит тип лида
+          и подготовит карточку и черновик ответа для менеджера.
+        </p>
+      </div>
+      <span class="pill pill-muted" id="model-pill" hidden></span>
+    </header>
+
+    <div class="alert alert-warn" id="health-alert" hidden></div>
+
+    <section class="panel">
+      <label class="label" for="lead-text">Текст заявки</label>
+      <textarea id="lead-text" rows="9" autofocus
+        placeholder="Вставьте сюда текст заявки клиента..."></textarea>
+
+      <div class="toolbar">
+        <button id="submit-btn" class="btn btn-primary" type="button">Обработать</button>
+        <button id="clear-btn" class="btn btn-ghost" type="button">Очистить</button>
+        <span id="spinner" class="spinner" hidden></span>
+        <span id="status-text" class="status-text" hidden></span>
+      </div>
+    </section>
+
+    <div class="alert alert-error" id="error-box" hidden></div>
+
+    <section id="result" class="result" hidden>
+      <div class="result-head">
+        <div class="badges">
+          <span id="lead-badge" class="pill"></span>
+          <span id="human-badge" class="pill" hidden></span>
+        </div>
+        <div class="result-actions">
+          <button id="copy-card" class="btn btn-small" type="button">Копировать карточку</button>
+          <button id="copy-reply" class="btn btn-small" type="button">Копировать ответ</button>
+        </div>
+      </div>
+
+      <div class="fields">
+        <div class="field field-wide">
+          <span class="field-label">Компания</span>
+          <span class="field-value" id="f-company"></span>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Суть запроса</span>
+          <span class="field-value" id="f-summary"></span>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Почему такой тип лида</span>
+          <span class="field-value" id="f-lead-type-reason"></span>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Следующий шаг</span>
+          <span class="field-value" id="f-next-step"></span>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Известные данные</span>
+          <div class="keydata" id="f-key-data"></div>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Чего не хватает</span>
+          <div class="chips" id="f-missing"></div>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Уточняющие вопросы</span>
+          <div class="chips" id="f-questions"></div>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Причина передачи человеку</span>
+          <span class="field-value" id="f-human-reason"></span>
+        </div>
+        <div class="field field-wide">
+          <span class="field-label">Черновик ответа</span>
+          <div class="reply" id="f-reply"></div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="foot">
+      Данные нигде не сохраняются: заявка обработана — карточка показана — и всё.
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
