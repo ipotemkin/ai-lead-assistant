@@ -46,6 +46,18 @@
         <span class="form-error" id="err-request" hidden></span>
       </label>
 
+      <div class="llm-preview" id="llm-preview">
+        <div class="llm-preview-head">
+          <span class="llm-preview-title">Текст, который уходит в LLM</span>
+          <span class="llm-preview-meta" id="llm-preview-meta"></span>
+        </div>
+        <pre class="llm-preview-body" id="llm-preview-body">Заполните форму — здесь появится текст, который увидит модель.</pre>
+        <p class="llm-preview-note">
+          Персональные данные заменяются временными токенами, после ответа модели значения
+          подставляются обратно. Названия компаний, суммы и количества не меняются.
+        </p>
+      </div>
+
       <p class="form-hint">Контактные поля необязательны — но с ними карточка получается точнее.</p>
 
       <div class="toolbar">

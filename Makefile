@@ -16,7 +16,7 @@ STAMP  := $(VENV)/.deps_ok
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup run clean
+.PHONY: help setup run test clean
 
 help: ## Показать список команд
 	@echo ""
@@ -44,6 +44,9 @@ run: setup ## Запустить приложение
 		echo "  Остановить: Ctrl+C"; \
 		echo ""
 	@$(BIN)/python app.py
+
+test: setup ## Проверить обезличивание персональных данных
+	@$(BIN)/python test_anonymizer.py
 
 clean: ## Удалить кэши Python
 	@rm -rf __pycache__ */__pycache__

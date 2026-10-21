@@ -22,6 +22,8 @@ const requestInput = el('f-request');
 const errRequest = el('err-request');
 const errPhone = el('err-phone');
 const errEmail = el('err-email');
+const previewBody = el('llm-preview-body');
+const previewMeta = el('llm-preview-meta');
 const errorBox = el('error-box');
 const resultBox = el('result');
 const spinner = el('spinner');
@@ -181,6 +183,52 @@ async function copyText(text, button) {
   setTimeout(() => { button.textContent = original; }, 1800);
 }
 
+/* --- Предпросмотр: что уйдёт в модель ---------------------------------- */
+
+let previewTimer = null;
+let previewSeq = 0;
+
+function formPayload() {
+  return {
+    text: requestInput.value.trim(),
+    name: nameInput.value.trim(),
+    phone: phoneInput.value.trim(),
+    email: emailInput.value.trim(),
+  };
+}
+
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(updatePreview, 400);
+}
+
+async function updatePreview() {
+  const payload = formPayload();
+  const isEmpty = !payload.text && !payload.name && !payload.phone && !payload.email;
+
+  if (isEmpty) {
+    previewBody.textContent = 'Заполните форму — здесь появится текст, который увидит модель.';
+    previewMeta.textContent = '';
+    return;
+  }
+
+  const seq = ++previewSeq;
+  try {
+    const response = await fetch('/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) return;
+    const data = await response.json();
+    if (seq !== previewSeq) return; // пока пришёл более свежий ответ
+    previewBody.textContent = data.llm_request || '(пусто)';
+    previewMeta.textContent = data.summary ? `скрыто: ${data.summary}` : 'персональных данных нет';
+  } catch (err) {
+    /* предпросмотр не критичен — молча оставляем прошлый текст */
+  }
+}
+
 /* --- Проверка полей --------------------------------------------------- */
 
 function showFieldError(input, box, message) {
@@ -243,12 +291,7 @@ async function analyze() {
     const response = await fetch('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: requestInput.value.trim(),
-        name: nameInput.value.trim(),
-        phone: phoneInput.value.trim(),
-        email: emailInput.value.trim(),
-      }),
+      body: JSON.stringify(formPayload()),
     });
 
     let data = null;
@@ -266,6 +309,20 @@ async function analyze() {
 
     lastCard = data;
     renderCard(data);
+
+    // Показываем фактически отправленный текст (он обезличен)
+    if (data.llm_request) {
+      previewBody.textContent = data.llm_request;
+      const counts = {};
+      (data.entities || []).forEach((item) => {
+        counts[item.type] = (counts[item.type] || 0) + 1;
+      });
+      const summary = Object.keys(counts)
+        .map((name) => `${name} (${counts[name]})`)
+        .join(', ');
+      previewMeta.textContent = summary ? `скрыто: ${summary}` : 'персональных данных нет';
+    }
+
     resultBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (err) {
     showError('Нет связи с приложением. Убедитесь, что сервер запущен, и попробуйте ещё раз.');
@@ -315,6 +372,8 @@ clearBtn.addEventListener('click', () => {
   clearFieldError(emailInput, errEmail);
   clearError();
   resultBox.hidden = true;
+  previewBody.textContent = 'Заполните форму — здесь появится текст, который увидит модель.';
+  previewMeta.textContent = '';
   requestInput.focus();
 });
 
@@ -322,10 +381,16 @@ clearBtn.addEventListener('click', () => {
   input.addEventListener('input', () => {
     if (input === emailInput) clearFieldError(emailInput, errEmail);
     if (input === requestInput) clearFieldError(requestInput, errRequest);
+    schedulePreview();
   });
 });
 
-phoneInput.addEventListener('input', () => clearFieldError(phoneInput, errPhone));
+phoneInput.addEventListener('input', () => {
+  clearFieldError(phoneInput, errPhone);
+  schedulePreview();
+});
+
+nameInput.addEventListener('input', schedulePreview);
 
 // Ctrl + Enter (Cmd + Enter на Mac) отправляет заявку из многострочного поля
 requestInput.addEventListener('keydown', (event) => {

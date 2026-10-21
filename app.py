@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ai import AIError, analyze_lead, get_api_key, get_base_url, get_model
+from anonymizer import anonymize, restore
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -393,7 +394,43 @@ def normalize_card(raw: Any) -> dict[str, Any]:
         "needs_human": needs_human,
         "human_reason": reason,
         "clarifying_questions": _as_list(raw.get("clarifying_questions"))[:2],
+        # Служебные поля: заполняются на сервере, модель их не возвращает
+        "llm_request": raw.get("llm_request") or "",
+        "entities": raw.get("entities") or [],
     }
+
+
+def restore_card(card: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+    """Подставляет настоящие значения вместо токенов во всех строковых полях карточки."""
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return restore(value, mapping)
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        return value
+
+    return walk(card)
+
+
+def fill_contacts_from_form(card: dict[str, Any], payload: "LeadCardRequest") -> dict[str, Any]:
+    """
+    Подстраховка: если модель не разглядела токены и вернула «не указано»,
+    берём контактные данные из формы — там они точные.
+    """
+    key_data = dict(card.get("key_data") or {})
+
+    if payload.name and key_data.get("name") in (NOT_SPECIFIED, "", None):
+        key_data["name"] = payload.name
+
+    contacts = [value for value in (payload.phone, payload.email) if value]
+    if contacts and key_data.get("contact") in (NOT_SPECIFIED, "", None):
+        key_data["contact"] = ", ".join(contacts)
+
+    card["key_data"] = key_data
+    return card
 
 
 def detect_conflicts(text: str) -> list[str]:
@@ -534,6 +571,13 @@ class KeyDataModel(BaseModel):
     deadline: str = NOT_SPECIFIED
 
 
+class EntityFinding(BaseModel):
+    """Найденный фрагмент персональных данных — без самого значения."""
+
+    token: str
+    type: str
+
+
 class LeadCardResponse(BaseModel):
     company: str
     summary: str
@@ -546,6 +590,8 @@ class LeadCardResponse(BaseModel):
     needs_human: bool
     human_reason: str
     clarifying_questions: list[str]
+    llm_request: str = ""
+    entities: list[EntityFinding] = []
 
     @model_validator(mode="before")
     @classmethod
@@ -585,6 +631,31 @@ def health() -> dict[str, Any]:
     }
 
 
+class PreviewRequest(BaseModel):
+    """Поля формы для предпросмотра обезличивания (без обработки AI)."""
+
+    text: str = Field(default="", max_length=10000)
+    name: str = Field(default="", max_length=200)
+    phone: str = Field(default="", max_length=100)
+    email: str = Field(default="", max_length=200)
+
+
+@app.post("/api/preview")
+async def preview(payload: PreviewRequest) -> dict[str, Any]:
+    """Показывает текст, который уйдёт в LLM. К AI не обращается."""
+    request_text = compose_request_text(
+        payload.text.strip(), payload.name.strip(), payload.phone.strip(), payload.email.strip()
+    )
+    result = anonymize(
+        request_text, known_values=[payload.name, payload.phone, payload.email]
+    )
+    return {
+        "llm_request": result.text,
+        "entities": result.findings,
+        "summary": result.summary,
+    }
+
+
 @app.post("/api/analyze", response_model=LeadCardResponse)
 async def analyze(payload: LeadCardRequest) -> Any:
     """Главный сценарий: поля формы -> карточка лида."""
@@ -596,8 +667,20 @@ async def analyze(payload: LeadCardRequest) -> Any:
         payload.text, payload.name, payload.phone, payload.email
     )
 
-    raw = await analyze_lead(request_text, description)
+    # Персональные данные заменяются токенами. Соответствие живёт только
+    # в памяти этого запроса и исчезает после формирования ответа.
+    anonymized = anonymize(
+        request_text, known_values=[payload.name, payload.phone, payload.email]
+    )
+
+    raw = await analyze_lead(anonymized.text, description)
     card = apply_guards(normalize_card(raw), request_text)
+    card = restore_card(card, anonymized.mapping)
+    card = fill_contacts_from_form(card, payload)
+
+    # Текст, который ушёл в модель, показываем обезличенным
+    card["llm_request"] = anonymized.text
+    card["entities"] = anonymized.findings
     return card
 
 
