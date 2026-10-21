@@ -24,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ai import AIError, analyze_lead, get_api_key, get_base_url, get_model
 
@@ -481,6 +482,9 @@ def apply_guards(card: dict[str, Any], text: str) -> dict[str, Any]:
 
 class LeadCardRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=10000, description="Текст заявки")
+    name: str = Field(default="", max_length=200, description="Имя контактного лица")
+    phone: str = Field(default="", max_length=100, description="Телефон")
+    email: str = Field(default="", max_length=200, description="Электронная почта")
     company_description: str = Field(
         default="", max_length=5000, description="Описание продуктов компании"
     )
@@ -493,10 +497,31 @@ class LeadCardRequest(BaseModel):
             raise ValueError("Текст заявки не может быть пустым")
         return cleaned
 
-    @field_validator("company_description")
+    @field_validator("name", "phone", "email", "company_description")
     @classmethod
-    def _trim_description(cls, value: str) -> str:
+    def _trim(cls, value: str) -> str:
         return value.strip()
+
+
+def compose_request_text(text: str, name: str, phone: str, email: str) -> str:
+    """
+    Собирает из полей формы понятный для AI текст заявки.
+
+    Контактные данные подставляются сверху отдельными строками, чтобы AI
+    надёжно забирал их в key_data.name и key_data.contact.
+    """
+    header: list[str] = []
+    if name:
+        header.append(f"Имя: {name}")
+    if phone:
+        header.append(f"Телефон: {phone}")
+    if email:
+        header.append(f"Почта: {email}")
+
+    body = text.strip()
+    if not header:
+        return body
+    return "\n".join(header) + "\n\n" + body
 
 
 class KeyDataModel(BaseModel):
@@ -562,13 +587,17 @@ def health() -> dict[str, Any]:
 
 @app.post("/api/analyze", response_model=LeadCardResponse)
 async def analyze(payload: LeadCardRequest) -> Any:
-    """Главный сценарий: текст заявки -> карточка лида."""
+    """Главный сценарий: поля формы -> карточка лида."""
     description = payload.company_description.strip() or (
         os.getenv("COMPANY_DESCRIPTION") or ""
     ).strip()
 
-    raw = await analyze_lead(payload.text.strip(), description)
-    card = apply_guards(normalize_card(raw), payload.text)
+    request_text = compose_request_text(
+        payload.text, payload.name, payload.phone, payload.email
+    )
+
+    raw = await analyze_lead(request_text, description)
+    card = apply_guards(normalize_card(raw), request_text)
     return card
 
 
@@ -588,6 +617,24 @@ async def validation_error_handler(_: Request, exc: RequestValidationError) -> J
         if error_type.startswith("missing"):
             message = "Проверьте форму: текст заявки обязателен."
     return JSONResponse(status_code=400, content={"error": message})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Логируем запросы к несуществующим адресам — так видно, кто стучится."""
+    if exc.status_code == 404:
+        agent = request.headers.get("user-agent") or "не указан"
+        print(
+            f"[404] Неизвестный адрес: {request.method} {request.url.path} "
+            f"(User-Agent: {agent})",
+            file=sys.stderr,
+            flush=True,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": "Адрес не найден. Приложение доступно на /, /api/analyze и /health."},
+        headers=getattr(exc, "headers", None),
+    )
 
 
 @app.exception_handler(Exception)

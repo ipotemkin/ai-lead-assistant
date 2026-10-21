@@ -12,7 +12,7 @@
       <div class="head-text">
         <h1>AI-помощник по обработке заявок</h1>
         <p class="lead">
-          Вставьте текст заявки — помощник вытащит данные, определит тип лида
+          Заполните форму — помощник вытащит данные, определит тип лида
           и подготовит карточку и черновик ответа для менеджера.
         </p>
       </div>
@@ -21,18 +21,40 @@
 
     <div class="alert alert-warn" id="health-alert" hidden></div>
 
-    <section class="panel">
-      <label class="label" for="lead-text">Текст заявки</label>
-      <textarea id="lead-text" rows="9" autofocus
-        placeholder="Вставьте сюда текст заявки клиента..."></textarea>
+    <form class="panel" id="lead-form" novalidate>
+      <div class="form-grid">
+        <label class="form-field">
+          <span class="form-label">Имя</span>
+          <input type="text" id="f-name" autocomplete="name" placeholder="Иван Петров">
+        </label>
+        <label class="form-field">
+          <span class="form-label">Телефон</span>
+          <input type="tel" id="f-phone" autocomplete="tel" placeholder="+7 900 123-45-67">
+          <span class="form-error" id="err-phone" hidden></span>
+        </label>
+        <label class="form-field">
+          <span class="form-label">Почта</span>
+          <input type="email" id="f-email" autocomplete="email" placeholder="ivanov@company.ru">
+          <span class="form-error" id="err-email" hidden></span>
+        </label>
+      </div>
+
+      <label class="form-field">
+        <span class="form-label">Заявка <span class="req">*</span></span>
+        <textarea id="f-request" rows="8" autofocus
+          placeholder="Опишите, что нужно: какой товар, сколько, на каких условиях."></textarea>
+        <span class="form-error" id="err-request" hidden></span>
+      </label>
+
+      <p class="form-hint">Контактные поля необязательны — но с ними карточка получается точнее.</p>
 
       <div class="toolbar">
-        <button id="submit-btn" class="btn btn-primary" type="button">Обработать</button>
+        <button id="submit-btn" class="btn btn-primary" type="submit">Обработать</button>
         <button id="clear-btn" class="btn btn-ghost" type="button">Очистить</button>
         <span id="spinner" class="spinner" hidden></span>
         <span id="status-text" class="status-text" hidden></span>
       </div>
-    </section>
+    </form>
 
     <div class="alert alert-error" id="error-box" hidden></div>
 

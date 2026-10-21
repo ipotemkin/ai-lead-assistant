@@ -14,7 +14,14 @@ const el = (id) => document.getElementById(id);
 
 const submitBtn = el('submit-btn');
 const clearBtn = el('clear-btn');
-const textArea = el('lead-text');
+const form = el('lead-form');
+const nameInput = el('f-name');
+const phoneInput = el('f-phone');
+const emailInput = el('f-email');
+const requestInput = el('f-request');
+const errRequest = el('err-request');
+const errPhone = el('err-phone');
+const errEmail = el('err-email');
 const errorBox = el('error-box');
 const resultBox = el('result');
 const spinner = el('spinner');
@@ -174,13 +181,57 @@ async function copyText(text, button) {
   setTimeout(() => { button.textContent = original; }, 1800);
 }
 
+/* --- Проверка полей --------------------------------------------------- */
+
+function showFieldError(input, box, message) {
+  if (box) {
+    box.textContent = message;
+    box.hidden = false;
+  }
+  if (input) input.classList.add('invalid');
+}
+
+function clearFieldError(input, box) {
+  if (box) {
+    box.textContent = '';
+    box.hidden = true;
+  }
+  if (input) input.classList.remove('invalid');
+}
+
+function validate() {
+  clearFieldError(requestInput, errRequest);
+  clearFieldError(emailInput, errEmail);
+  clearFieldError(phoneInput, errPhone);
+
+  let ok = true;
+
+  const request = requestInput.value.trim();
+  if (!request) {
+    showFieldError(requestInput, errRequest, 'Впишите текст заявки — без него обрабатывать нечего.');
+    ok = false;
+  }
+
+  const email = emailInput.value.trim();
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    showFieldError(emailInput, errEmail, 'Проверьте адрес почты — похоже, в нём опечатка.');
+    ok = false;
+  }
+
+  const phone = phoneInput.value.trim();
+  if (phone && phone.replace(/\D/g, '').length < 6) {
+    showFieldError(phoneInput, errPhone, 'Проверьте телефон — слишком мало цифр.');
+    ok = false;
+  }
+
+  return ok;
+}
+
 /* --- Отправка запроса -------------------------------------------------- */
 
 async function analyze() {
-  const text = textArea.value.trim();
-  if (!text) {
-    showError('Вставьте текст заявки — поле пустое.');
-    textArea.focus();
+  if (!validate()) {
+    errorBox.hidden = true;
     return;
   }
 
@@ -192,7 +243,12 @@ async function analyze() {
     const response = await fetch('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text }),
+      body: JSON.stringify({
+        text: requestInput.value.trim(),
+        name: nameInput.value.trim(),
+        phone: phoneInput.value.trim(),
+        email: emailInput.value.trim(),
+      }),
     });
 
     let data = null;
@@ -246,17 +302,35 @@ async function loadHealth() {
   }
 }
 
-submitBtn.addEventListener('click', analyze);
-
-clearBtn.addEventListener('click', () => {
-  textArea.value = '';
-  clearError();
-  resultBox.hidden = true;
-  textArea.focus();
+// Отправка по кнопке и по Enter в любом поле формы
+form.addEventListener('submit', (event) => {
+  event.preventDefault();
+  analyze();
 });
 
-textArea.addEventListener('keydown', (event) => {
+clearBtn.addEventListener('click', () => {
+  form.reset();
+  clearFieldError(requestInput, errRequest);
+  clearFieldError(phoneInput, errPhone);
+  clearFieldError(emailInput, errEmail);
+  clearError();
+  resultBox.hidden = true;
+  requestInput.focus();
+});
+
+[requestInput, emailInput].forEach((input) => {
+  input.addEventListener('input', () => {
+    if (input === emailInput) clearFieldError(emailInput, errEmail);
+    if (input === requestInput) clearFieldError(requestInput, errRequest);
+  });
+});
+
+phoneInput.addEventListener('input', () => clearFieldError(phoneInput, errPhone));
+
+// Ctrl + Enter (Cmd + Enter на Mac) отправляет заявку из многострочного поля
+requestInput.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+    event.preventDefault();
     analyze();
   }
 });
