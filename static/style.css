@@ -283,6 +283,65 @@ textarea:focus {
 
 .alert-error { background: var(--red-soft); color: var(--red); border-color: currentColor; }
 .alert-warn { background: var(--amber-soft); color: var(--amber); border-color: currentColor; }
+.alert-info {
+  background: var(--accent-soft);
+  color: var(--text);
+  border-color: var(--border);
+}
+.alert-info ul { margin: 8px 0 0; padding-left: 20px; }
+.alert-info li { margin-bottom: 3px; }
+.alert-info .ok { color: var(--green); font-weight: 600; }
+.alert-info .warn { color: var(--amber); font-weight: 600; }
+.alert-info .fail { color: var(--red); font-weight: 600; }
+
+/* Галочка отправки в CRM */
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  margin-right: 4px;
+}
+
+.checkbox input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* Блок результата отправки в CRM */
+.crm-block {
+  margin: 0 20px 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+.crm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.crm-title { font-weight: 600; font-size: 14px; }
+.crm-title.ok { color: var(--green); }
+.crm-title.fail { color: var(--red); }
+.crm-detail { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.crm-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.crm-errors {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--red);
+}
 
 /* Карточка результата */
 .result {
@@ -306,7 +365,13 @@ textarea:focus {
 }
 
 .badges { display: flex; gap: 8px; flex-wrap: wrap; }
-.result-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.result-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+.result-time {
+  font-size: 12.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
 
 .pill {
   display: inline-block;

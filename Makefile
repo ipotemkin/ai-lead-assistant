@@ -45,8 +45,10 @@ run: setup ## Запустить приложение
 		echo ""
 	@$(BIN)/python app.py
 
-test: setup ## Проверить обезличивание персональных данных
+test: setup ## Проверить обезличивание, интеграцию с Битрикс24 и журнал
 	@$(BIN)/python test_anonymizer.py
+	@$(BIN)/python test_bitrix.py
+	@$(BIN)/python test_log.py
 
 clean: ## Удалить кэши Python
 	@rm -rf __pycache__ */__pycache__

@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+import logbuf
+
 # Значения по умолчанию. Реальные значения приходят из файла .env (см. app.py).
 DEFAULT_BASE_URL = "https://api.proxyapi.ru/v1"
 DEFAULT_MODEL = "openai/gpt-5-mini"
@@ -156,7 +158,11 @@ RULES = """ТВОЯ ЗАДАЧА
      «компенсируем ущерб».
 9. next_step — одно конкретное действие менеджера, коротко.
 10. reply_draft — короткий черновик ответа клиенту на русском языке, 1–3 предложения,
-    без неподтверждённых обещаний.
+    без неподтверждённых обещаний. Обращайся к клиенту по имени или по имени и отчеству:
+    «Здравствуйте, Мария!» или «Здравствуйте, Мария Сергеевна!».
+    НИКОГДА не используй обращение «Фамилия Имя» (например «Здравствуйте, Савельева Мария!») —
+    это форма для документов, а не для разговора. Если знаешь только фамилию — обращайся
+    по фамилии или вообще без обращения.
 11. summary — суть запроса в 1–2 предложениях.
 12. Тон — деловой и нейтральный. Язык — русский.
 13. Не упоминай внутренние отделы, должности и процессы компании (отдел кадров, склад,
@@ -397,6 +403,8 @@ async def analyze_lead(text: str, company_description: str) -> dict[str, Any]:
     }
 
     timeout = httpx.Timeout(TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS)
+    timer = logbuf.Timer()
+    response_format = "json_schema"
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -407,12 +415,28 @@ async def analyze_lead(text: str, company_description: str) -> dict[str, Any]:
 
             # 2) Не каждая модель умеет строгий режим — пробуем облегчённый.
             if response.status_code == 400 and _mentions_response_format(response.text):
+                logbuf.log(
+                    "ai.fallback",
+                    "Строгий JSON не поддержан, пробуем облегчённый",
+                    duration_ms=timer.ms,
+                    model=model,
+                )
+                response_format = "json_object"
+                timer = logbuf.Timer()
                 response = await client.post(
                     url, headers=headers, json={**payload, "response_format": {"type": "json_object"}}
                 )
 
             if response.status_code >= 400:
                 message, error_status = _friendly_error(response.status_code, response.text)
+                logbuf.log(
+                    "ai.error",
+                    message,
+                    duration_ms=timer.ms,
+                    level="error",
+                    model=model,
+                    http=response.status_code,
+                )
                 raise AIError(message, status_code=error_status)
 
             data = response.json()
@@ -432,11 +456,44 @@ async def analyze_lead(text: str, company_description: str) -> dict[str, Any]:
                 status_code=502,
             ) from exc
 
+    usage = data.get("usage") or {}
+    logbuf.log(
+        "ai.request",
+        f"Модель {model} ответила",
+        duration_ms=timer.ms,
+        model=model,
+        format=response_format,
+        http=response.status_code,
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        total_tokens=usage.get("total_tokens"),
+    )
+
     content = _extract_content(data)
     if not content:
         raise AIError("AI вернул пустой ответ. Попробуйте ещё раз.", status_code=502)
 
-    return _extract_json(content)
+    timer = logbuf.Timer()
+    try:
+        result = _extract_json(content)
+    except AIError:
+        logbuf.log(
+            "ai.parse",
+            "Ответ не удалось разобрать",
+            duration_ms=timer.ms,
+            level="error",
+            content_len=len(content),
+        )
+        raise
+
+    logbuf.log(
+        "ai.parse",
+        "Ответ разобран",
+        duration_ms=timer.ms,
+        content_len=len(content),
+        fields=len(result),
+    )
+    return result
 
 
 def _mentions_response_format(body: str) -> bool:

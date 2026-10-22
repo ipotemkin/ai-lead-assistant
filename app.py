@@ -12,8 +12,10 @@ AI-помощник для первичной обработки заявок.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,8 +28,31 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import logbuf
 from ai import AIError, analyze_lead, get_api_key, get_base_url, get_model
-from anonymizer import anonymize, restore
+from anonymizer import (
+    address_form,
+    anonymize,
+    canonical_name,
+    capitalize_names_in_text,
+    capitalize_word,
+    natural_name_order,
+    person_parts,
+    restore,
+)
+from bitrix import (
+    BitrixError,
+    add_comment,
+    call as bitrix_call,
+    create_lead,
+    create_task,
+    get_chat_id,
+    get_manager_id,
+    get_portal_url,
+    get_source_id,
+    lead_url,
+    notify,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -397,6 +422,8 @@ def normalize_card(raw: Any) -> dict[str, Any]:
         # Служебные поля: заполняются на сервере, модель их не возвращает
         "llm_request": raw.get("llm_request") or "",
         "entities": raw.get("entities") or [],
+        "crm": raw.get("crm") or {},
+        "timing": raw.get("timing") or {},
     }
 
 
@@ -413,6 +440,139 @@ def restore_card(card: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any
         return value
 
     return walk(card)
+
+
+_GREETING_RE = re.compile(
+    r"(?i)\b(здравствуй\w*|добрый\s+день|доброе\s+утро|добрый\s+вечер|привет\w*)\s*,\s*"
+    r"((?:[А-ЯЁ][а-яёA-Za-z-]+)(?:\s+[А-ЯЁ][а-яёA-Za-z-]+)?)"
+)
+
+
+def fix_greeting_name(text: str, raw_name: str) -> str:
+    """
+    В приветствии обращаемся по имени, а не «Фамилия Имя».
+
+    «Здравствуйте, Савельева Мария!» -> «Здравствуйте, Мария!»
+    """
+    if not text or not raw_name:
+        return text
+
+    first, patronymic, surname = person_parts(raw_name)
+    if not first:
+        return text
+
+    # Форма обращения — с большой буквы: «Иван», «Мария Сергеевна».
+    first = capitalize_word(first)
+    patronymic = capitalize_word(patronymic)
+    address = f"{first} {patronymic}".strip()
+    variants = {
+        " ".join(part for part in (first, patronymic, surname) if part).lower(),
+        " ".join(part for part in (surname, first) if part).lower(),
+        first.lower(),
+        address.lower(),
+    }
+    variants.discard("")
+
+    def replace(match: re.Match[str]) -> str:
+        matched = match.group(2).strip().lower()
+        if matched in variants:
+            return f"{match.group(1)}, {address}"
+        return match.group(0)
+
+    return _GREETING_RE.sub(replace, text)
+
+
+def fix_name_capitalization(card: dict[str, Any]) -> dict[str, Any]:
+    """
+    Приводит имена к правильному регистру: «иван» -> «Иван».
+
+    Клиент часто пишет имя с маленькой буквы. Ориентиром служит поле
+    «Имя» в известных данных — по нему понимаем, как имя должно выглядеть,
+    и приводим к этому виду все упоминания в текстах карточки.
+    """
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return fix_text(value)
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        return value
+
+    key_data = dict(card.get("key_data") or {})
+    raw_name = str(key_data.get("name") or "").strip()
+    # «Савельева Мария» -> «Мария Савельева»: привычный порядок для карточки
+    canonical = canonical_name(natural_name_order(raw_name))
+
+    first, patronymic, surname = person_parts(raw_name)
+    if canonical and canonical != raw_name:
+        key_data["name"] = canonical
+
+    # Слова имени -> правильная форма. Сопоставление по самому слову, а не по
+    # позиции: иначе после перестановки «Савельева Мария» превратилось бы
+    # в «Мария Савельева» -> «Мария Савельева» с перепутанными словами.
+    name_parts: list[tuple[str, str]] = []
+    for raw_part, canonical_part in (
+        (first, first),
+        (patronymic, patronymic),
+        (surname, surname),
+    ):
+        if not raw_part:
+            continue
+        target = capitalize_word(canonical_part)
+        if target != raw_part:
+            name_parts.append((raw_part, target))
+
+    # Полные формы имени в любом порядке -> привычный порядок.
+    order_variants: list[str] = []
+    if first and surname:
+        if patronymic:
+            order_variants = [
+                f"{first} {patronymic} {surname}",
+                f"{surname} {first} {patronymic}",
+            ]
+        else:
+            order_variants = [f"{first} {surname}", f"{surname} {first}"]
+
+    def fix_text(text: str) -> str:
+        if not text:
+            return text
+        # Один проход: иначе замены мешают друг другу.
+        if name_parts:
+            pattern = re.compile(
+                "|".join(
+                    r"(?<![\w-])" + re.escape(source) + r"(?![\w-])"
+                    for source, _ in name_parts
+                ),
+                re.IGNORECASE,
+            )
+            targets = {source.lower(): target for source, target in name_parts}
+            text = pattern.sub(lambda m: targets.get(m.group(0).lower(), m.group(0)), text)
+        if order_variants and canonical:
+            pattern = re.compile(
+                "|".join(
+                    r"(?<![\w-])" + re.escape(variant) + r"(?![\w-])"
+                    for variant in order_variants
+                ),
+                re.IGNORECASE,
+            )
+            text = pattern.sub(lambda _: canonical, text)
+        return text
+
+    result = walk(card)
+    if isinstance(result, dict):
+        # В текстах для менеджера дополнительно поднимаем имена с маленькой буквы:
+        # там имя может стоять отдельно («Здравствуйте, иван!»).
+        for field in ("reply_draft", "next_step"):
+            if isinstance(result.get(field), str):
+                result[field] = capitalize_names_in_text(result[field])
+        # В приветствии обращаемся по имени, а не «Фамилия Имя».
+        if isinstance(result.get("reply_draft"), str):
+            result["reply_draft"] = fix_greeting_name(result["reply_draft"], raw_name)
+        if isinstance(result.get("key_data"), dict):
+            result["key_data"]["name"] = canonical or key_data.get("name", NOT_SPECIFIED)
+    return result
 
 
 def fill_contacts_from_form(card: dict[str, Any], payload: "LeadCardRequest") -> dict[str, Any]:
@@ -525,6 +685,7 @@ class LeadCardRequest(BaseModel):
     company_description: str = Field(
         default="", max_length=5000, description="Описание продуктов компании"
     )
+    send_to_crm: bool = Field(default=True, description="Отправить карточку в Битрикс24")
 
     @field_validator("text")
     @classmethod
@@ -578,6 +739,27 @@ class EntityFinding(BaseModel):
     type: str
 
 
+class CrmResult(BaseModel):
+    """Что получилось при отправке карточки в Битрикс24."""
+
+    sent: bool = False
+    lead_id: int | None = None
+    lead_url: str = ""
+    comment_id: int | None = None
+    task_id: str = ""
+    task_kind: str = ""
+    message_id: int | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class Timing(BaseModel):
+    """Сколько времени заняла обработка, в секундах."""
+
+    ai: float = 0.0
+    crm: float = 0.0
+    total: float = 0.0
+
+
 class LeadCardResponse(BaseModel):
     company: str
     summary: str
@@ -592,6 +774,8 @@ class LeadCardResponse(BaseModel):
     clarifying_questions: list[str]
     llm_request: str = ""
     entities: list[EntityFinding] = []
+    crm: CrmResult = Field(default_factory=CrmResult)
+    timing: Timing = Field(default_factory=Timing)
 
     @model_validator(mode="before")
     @classmethod
@@ -640,6 +824,71 @@ class PreviewRequest(BaseModel):
     email: str = Field(default="", max_length=200)
 
 
+def _dialog_id(item: dict[str, Any]) -> str:
+    """Идентификатор чата для im.message.add.
+
+    Для группового чата — «chat<id>», для личной переписки — ID пользователя.
+    """
+    if str(item.get("type") or "").lower() == "chat":
+        return f"chat{item.get('chat_id')}"
+    return str(item.get("id") or "")
+
+
+async def push_to_crm(card: dict[str, Any]) -> dict[str, Any]:
+    """
+    Отправляет карточку в Битрикс24: лид, комментарий, задача, уведомление.
+
+    Каждый шаг выполняется независимо: если задача не создалась, лид и комментарий
+    уже в CRM, а проблема попадает в errors. Карточка при этом не теряется.
+    """
+    result: dict[str, Any] = {
+        "sent": False,
+        "lead_id": None,
+        "lead_url": "",
+        "comment_id": None,
+        "task_id": "",
+        "task_kind": "",
+        "message_id": None,
+        "errors": [],
+    }
+
+    try:
+        lead_id = await create_lead(card)
+    except BitrixError as exc:
+        result["errors"].append(f"Лид не создан: {exc.message}")
+        return result
+    except Exception as exc:  # noqa: BLE001 — CRM не должен ломать обработку
+        result["errors"].append(f"Лид не создан: {exc}")
+        return result
+
+    result["sent"] = True
+    result["lead_id"] = lead_id
+    result["lead_url"] = lead_url(lead_id)
+
+    try:
+        result["comment_id"] = await add_comment(lead_id, card)
+    except BitrixError as exc:
+        result["errors"].append(f"Комментарий не добавлен: {exc.message}")
+
+    try:
+        task = await create_task(lead_id, card)
+        result["task_id"] = task.get("id") or ""
+        result["task_kind"] = task.get("kind") or "task"
+        if task.get("kind") == "activity":
+            result["errors"].append(
+                "У вебхука нет прав на раздел «Задачи» — вместо задачи создано дело «Звонок» в таймлайне лида."
+            )
+    except BitrixError as exc:
+        result["errors"].append(f"Задача не создана: {exc.message}")
+
+    try:
+        result["message_id"] = await notify(lead_id, card)
+    except BitrixError as exc:
+        result["errors"].append(f"Уведомление не отправлено: {exc.message}")
+
+    return result
+
+
 @app.post("/api/preview")
 async def preview(payload: PreviewRequest) -> dict[str, Any]:
     """Показывает текст, который уйдёт в LLM. К AI не обращается."""
@@ -656,9 +905,219 @@ async def preview(payload: PreviewRequest) -> dict[str, Any]:
     }
 
 
+@app.post("/api/crm/send")
+async def crm_send(payload: dict[str, Any]) -> dict[str, Any]:
+    """Отправляет уже готовую карточку в CRM — без повторного вызова AI."""
+    card = normalize_card(payload)
+    return await push_to_crm(card)
+
+
+@app.get("/api/b24/check")
+async def b24_check() -> dict[str, Any]:
+    """Диагностика настройки Битрикс24: что работает, что нет и что подправить.
+
+    Отчёт только читает — ничего не создаёт. Ни одна отдельная проверка не может
+    уронить весь эндпоинт: сбой превращается в строку отчёта.
+    """
+    report: dict[str, Any] = {
+        "configured": bool(get_base_url()),
+        "portal": get_portal_url(),
+        "manager_id": get_manager_id(),
+        "chat_id": get_chat_id(),
+        "source_id": get_source_id(),
+        "checks": [],
+        "lead_stages": [],
+        "sources": [],
+        "chats": [],
+    }
+
+    def add_check(name: str, ok: bool, level: str, detail: str) -> None:
+        report["checks"].append(
+            {"name": name, "ok": ok, "level": level, "detail": detail}
+        )
+
+    async def probe(name: str, factory, detail_builder, level: str = "fail"):
+        """Выполняет проверку. Любая ошибка становится строкой отчёта, а не 500."""
+        try:
+            result = await factory()
+        except BitrixError as exc:
+            add_check(name, False, level, exc.message)
+            return None
+        except Exception as exc:  # noqa: BLE001 — отчёт не должен падать
+            add_check(name, False, "fail", f"ошибка проверки: {type(exc).__name__}: {exc}")
+            return None
+        detail = detail_builder(result) if detail_builder else ""
+        add_check(name, True, "ok", detail)
+        return result
+
+    if not report["configured"]:
+        add_check("Адрес вебхука", False, "fail", "Не задан B24_URL в файле .env")
+        return report
+
+    # 1. Вебхук и справочник стадий лида
+    stages = await probe(
+        "Вебхук и доступ к CRM",
+        lambda: bitrix_call(
+            "crm.status.list", {"filter": {"ENTITY_ID": "STATUS"}, "order": {"SORT": "ASC"}}
+        ),
+        lambda items: f"доступно стадий лида: {len(items or [])}",
+    )
+    if stages is None:
+        return report
+    report["lead_stages"] = [
+        {"id": item.get("STATUS_ID"), "name": item.get("NAME")} for item in stages or []
+    ]
+
+    # 2. Источники
+    sources = await probe(
+        "Источники лидов",
+        lambda: bitrix_call(
+            "crm.status.list", {"filter": {"ENTITY_ID": "SOURCE"}, "order": {"SORT": "ASC"}}
+        ),
+        lambda items: f"доступно источников: {len(items or [])}",
+    )
+    if sources is not None:
+        report["sources"] = [
+            {"id": item.get("STATUS_ID"), "name": item.get("NAME")} for item in sources or []
+        ]
+
+    # 3. Права на задачи (метод только читает — задачу не создаёт)
+    await probe(
+        "Права на задачи",
+        lambda: bitrix_call("tasks.task.getFields", {}),
+        lambda _: "раздел «Задачи» доступен, задачи будут создаваться",
+    )
+
+    # 4. Ответственный
+    manager_id = get_manager_id()
+    if not manager_id:
+        add_check(
+            "Ответственный",
+            False,
+            "fail",
+            "Не удалось определить ID: задайте B24_MANAGER_ID в файле .env",
+        )
+    else:
+        try:
+            user = await bitrix_call("user.get", {"ID": int(manager_id)})
+            # user.get возвращает массив пользователей
+            if isinstance(user, list):
+                user = user[0] if user else {}
+            if not isinstance(user, dict):
+                user = {}
+            full_name = " ".join(
+                part
+                for part in [user.get("NAME"), user.get("LAST_NAME")]
+                if isinstance(part, str) and part
+            ).strip()
+            add_check(
+                "Ответственный",
+                True,
+                "ok",
+                f"ID {manager_id} — {full_name or 'имя в профиле не заполнено'}",
+            )
+        except BitrixError as exc:
+            # Проверить имя не вышло — это не мешает создавать задачи.
+            if "прав" in exc.message.lower():
+                detail = (
+                    f"ID {manager_id} — у вебхука нет прав на просмотр пользователей. "
+                    "Созданию задач это не мешает."
+                )
+            else:
+                detail = f"ID {manager_id} — не удалось проверить: {exc.message}"
+            add_check("Ответственный", True, "warn", detail)
+        except Exception as exc:  # noqa: BLE001
+            add_check(
+                "Ответственный",
+                True,
+                "warn",
+                f"ID {manager_id} — не удалось проверить: {type(exc).__name__}: {exc}",
+            )
+
+    # 5. Чаты для уведомлений
+    chats = await probe(
+        "Список чатов",
+        lambda: bitrix_call(
+            "im.recent.list",
+            {"LIMIT": 10, "SKIP_OPENLINES": "Y", "UNREAD_ONLY": "N", "PARSE_TEXT": "N"},
+        ),
+        lambda result: (
+            f"доступно чатов: {len(result.get('items', []))}"
+            if isinstance(result, dict)
+            else "список получен"
+        ),
+        level="warn",
+    )
+    if chats is not None:
+        items = chats.get("items", []) if isinstance(chats, dict) else []
+        report["chats"] = [
+            {
+                "id": str(item.get("chat_id") or item.get("id") or ""),
+                "dialog_id": _dialog_id(item),
+                "title": item.get("title") or "",
+                "type": item.get("type") or "",
+            }
+            for item in items
+        ]
+        configured_chat = get_chat_id()
+        if configured_chat:
+            found = any(chat["dialog_id"] == configured_chat for chat in report["chats"])
+            add_check(
+                "Чат для уведомлений",
+                found,
+                "ok" if found else "fail",
+                f"B24_CHAT_ID = {configured_chat}"
+                if found
+                else f"чат {configured_chat} не найден в списке чатов",
+            )
+        else:
+            add_check(
+                "Чат для уведомлений",
+                False,
+                "warn",
+                "Не задан B24_CHAT_ID: уведомления отключены, выберите чат из списка",
+            )
+    else:
+        # Проверка чатов провалилась — сообщаем про чат отдельно
+        configured_chat = get_chat_id()
+        if not configured_chat:
+            add_check(
+                "Чат для уведомлений",
+                False,
+                "warn",
+                "Не задан B24_CHAT_ID: уведомления отключены",
+            )
+
+    return report
+
+
+@app.get("/api/log")
+def get_log(limit: int = 200) -> dict[str, Any]:
+    """Журнал операций приложения: что, сколько времени и с каким результатом.
+
+    Персональных данных в журнале нет — только длины, количества и время.
+    """
+    items = logbuf.records(limit=limit)
+    return {
+        "count": len(items),
+        "records": items,
+    }
+
+
+@app.delete("/api/log")
+def clear_log() -> dict[str, Any]:
+    """Очищает журнал операций."""
+    logbuf.clear()
+    return {"status": "ok"}
+
+
 @app.post("/api/analyze", response_model=LeadCardResponse)
 async def analyze(payload: LeadCardRequest) -> Any:
-    """Главный сценарий: поля формы -> карточка лида."""
+    """Главный сценарий: поля формы -> карточка лида -> Битрикс24."""
+    request_id = logbuf.new_request_id()
+    logbuf.set_request_id(request_id)
+    total_timer = logbuf.Timer()
+
     description = payload.company_description.strip() or (
         os.getenv("COMPANY_DESCRIPTION") or ""
     ).strip()
@@ -667,20 +1126,109 @@ async def analyze(payload: LeadCardRequest) -> Any:
         payload.text, payload.name, payload.phone, payload.email
     )
 
+    logbuf.log(
+        "request.received",
+        "Заявка принята",
+        text_len=len(request_text),
+        has_name=bool(payload.name),
+        has_phone=bool(payload.phone),
+        has_email=bool(payload.email),
+        send_to_crm=payload.send_to_crm,
+    )
+
     # Персональные данные заменяются токенами. Соответствие живёт только
     # в памяти этого запроса и исчезает после формирования ответа.
+    timer = logbuf.Timer()
     anonymized = anonymize(
         request_text, known_values=[payload.name, payload.phone, payload.email]
     )
+    logbuf.log(
+        "anonymize",
+        "Персональные данные обезличены",
+        duration_ms=timer.ms,
+        entities=len(anonymized.findings),
+        text_len=len(anonymized.text),
+    )
 
+    started = time.perf_counter()
     raw = await analyze_lead(anonymized.text, description)
-    card = apply_guards(normalize_card(raw), request_text)
+    ai_seconds = time.perf_counter() - started
+
+    timer = logbuf.Timer()
+    card = normalize_card(raw)
+    logbuf.log(
+        "card.normalize",
+        "Ответ приведён к единому виду",
+        duration_ms=timer.ms,
+        lead_type=card.get("lead_type"),
+    )
+
+    timer = logbuf.Timer()
+    card = apply_guards(card, request_text)
+    logbuf.log(
+        "card.guards",
+        "Проверены правила квалификации",
+        duration_ms=timer.ms,
+        lead_type=card.get("lead_type"),
+        needs_human=card.get("needs_human"),
+        missing=len(card.get("missing_data") or []),
+    )
+
+    timer = logbuf.Timer()
     card = restore_card(card, anonymized.mapping)
+    logbuf.log(
+        "card.restore",
+        "Возвращены настоящие значения",
+        duration_ms=timer.ms,
+        tokens=len(anonymized.mapping),
+    )
+
+    timer = logbuf.Timer()
     card = fill_contacts_from_form(card, payload)
+    card = fix_name_capitalization(card)
+    logbuf.log(
+        "card.fields",
+        "Уточнены контакты и имена",
+        duration_ms=timer.ms,
+        # само имя в журнал не пишем — только факт правки
+        name_normalized=bool(card.get("key_data", {}).get("name")),
+    )
 
     # Текст, который ушёл в модель, показываем обезличенным
     card["llm_request"] = anonymized.text
     card["entities"] = anonymized.findings
+
+    if payload.send_to_crm:
+        card["crm"] = await push_to_crm(card)
+    else:
+        card["crm"] = {
+            "sent": False,
+            "lead_id": None,
+            "lead_url": "",
+            "comment_id": None,
+            "task_id": "",
+            "task_kind": "",
+            "message_id": None,
+            "errors": [],
+        }
+        logbuf.log("crm.skipped", "Отправка в CRM отключена", duration_ms=0.0)
+
+    crm_seconds = time.perf_counter() - started - ai_seconds
+    card["timing"] = {
+        "ai": round(ai_seconds, 2),
+        "crm": round(crm_seconds, 2),
+        "total": round(time.perf_counter() - started, 2),
+    }
+
+    logbuf.log(
+        "request.done",
+        "Обработка завершена",
+        duration_ms=total_timer.ms,
+        ai_s=card["timing"]["ai"],
+        crm_s=card["timing"]["crm"],
+        lead_type=card.get("lead_type"),
+        crm_sent=bool((card.get("crm") or {}).get("sent")),
+    )
     return card
 
 

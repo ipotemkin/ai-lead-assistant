@@ -61,14 +61,21 @@
       <p class="form-hint">Контактные поля необязательны — но с ними карточка получается точнее.</p>
 
       <div class="toolbar">
+        <label class="checkbox">
+          <input type="checkbox" id="send-to-crm" checked>
+          <span>Отправить в Битрикс24</span>
+        </label>
         <button id="submit-btn" class="btn btn-primary" type="submit">Обработать</button>
         <button id="clear-btn" class="btn btn-ghost" type="button">Очистить</button>
+        <button id="b24-check-btn" class="btn btn-small" type="button">Проверить Битрикс24</button>
         <span id="spinner" class="spinner" hidden></span>
         <span id="status-text" class="status-text" hidden></span>
       </div>
     </form>
 
     <div class="alert alert-error" id="error-box" hidden></div>
+
+    <div class="alert alert-info" id="b24-report" hidden></div>
 
     <section id="result" class="result" hidden>
       <div class="result-head">
@@ -77,6 +84,7 @@
           <span id="human-badge" class="pill" hidden></span>
         </div>
         <div class="result-actions">
+          <span class="result-time" id="result-time" hidden></span>
           <button id="copy-card" class="btn btn-small" type="button">Копировать карточку</button>
           <button id="copy-reply" class="btn btn-small" type="button">Копировать ответ</button>
         </div>
@@ -119,6 +127,20 @@
           <span class="field-label">Черновик ответа</span>
           <div class="reply" id="f-reply"></div>
         </div>
+      </div>
+
+      <div class="crm-block" id="crm-block" hidden>
+        <div class="crm-head">
+          <div>
+            <span class="crm-title" id="crm-title"></span>
+            <div class="crm-detail" id="crm-detail"></div>
+          </div>
+          <div class="crm-actions">
+            <a class="btn btn-small" id="crm-link" target="_blank" rel="noopener" hidden>Открыть лид</a>
+            <button class="btn btn-small" id="crm-retry" type="button" hidden>Повторить отправку</button>
+          </div>
+        </div>
+        <ul class="crm-errors" id="crm-errors" hidden></ul>
       </div>
     </section>
 

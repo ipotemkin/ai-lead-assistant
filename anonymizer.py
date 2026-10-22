@@ -110,6 +110,13 @@ FEMALE_NAMES: frozenset[str] = frozenset(
 )
 
 
+# Формы имён, которые совпадают с обычными словами: их не поднимаем.
+# «Марк» -> «марка» (бренд), «Дина» -> «дина» (единица измерения).
+AMBIGUOUS_FORMS: frozenset[str] = frozenset(
+    {"марка", "марку", "марке", "марком", "дина", "дину", "май", "мая", "маю"}
+)
+
+
 def _female_declensions(name: str) -> set[str]:
     """Падежные формы женских имён: Мария -> Марии, Анна -> Анны."""
     forms: set[str] = set()
@@ -119,7 +126,7 @@ def _female_declensions(name: str) -> set[str]:
         forms.update({name[:-1] + "и", name[:-1] + "е"})
     elif name.endswith("ия"):
         forms.update({name[:-2] + "ии", name[:-2] + "ие"})
-    return forms
+    return forms - AMBIGUOUS_FORMS
 
 
 def _build_name_set() -> frozenset[str]:
@@ -178,6 +185,142 @@ CITY_FORMS: tuple[str, ...] = (
 
 def _city_names() -> frozenset[str]:
     return frozenset(name.lower() for name in set(CITIES) | set(CITY_FORMS))
+
+
+def is_known_first_name(word: str) -> bool:
+    """Известно ли это имя (в любом падеже)."""
+    return (word or "").strip().lower() in FIRST_NAMES
+
+
+def is_patronymic(word: str) -> bool:
+    """Похоже ли это слово на отчество."""
+    return bool(_PATRONYMIC_RE.fullmatch((word or "").strip()))
+
+
+def capitalize_word(word: str) -> str:
+    """«иван» -> «Иван», «ИВАН» -> «Иван», «Пётр» -> «Пётр»."""
+    if not word:
+        return word
+    if word.isupper() and len(word) > 1:
+        return word.capitalize()
+    return word[:1].upper() + word[1:]
+
+
+def canonical_name(full: str) -> str:
+    """«иван петров» -> «Иван Петров». Каждое слово с большой буквы."""
+    return " ".join(capitalize_word(word) for word in (full or "").split() if word)
+
+
+def person_parts(full: str) -> tuple[str, str, str]:
+    """
+    Разбирает ФИО на части: (имя, отчество, фамилия).
+
+    Учитывает оба порядка: «Иван Петров» и «Петров Иван».
+    Возвращает пустые строки, если что-то определить не удалось.
+    """
+    parts = [part for part in (full or "").split() if part]
+    if not parts:
+        return ("", "", "")
+
+    first = ""
+    for part in parts:
+        if is_known_first_name(part):
+            first = part
+            break
+    if not first:
+        return ("", "", "")
+
+    rest = [part for part in parts if part != first]
+    patronymic = ""
+    surname = ""
+    for part in rest:
+        if not patronymic and is_patronymic(part):
+            patronymic = part
+        elif not surname:
+            surname = part
+        else:
+            surname = f"{surname} {part}"
+    return (first, patronymic, surname)
+
+
+def natural_name_order(full: str) -> str:
+    """
+    Приводит ФИО к привычному порядку: «Савельева Мария» -> «Мария Савельева».
+
+    Форма «Фамилия Имя» встречается в подписях и документах, но в карточке
+    лида её читать неудобно.
+    """
+    first, patronymic, surname = person_parts(full)
+    if not first or not surname:
+        return (full or "").strip()
+    parts = [first]
+    if patronymic:
+        parts.append(patronymic)
+    parts.append(surname)
+    return " ".join(parts)
+
+
+def address_form(full: str) -> str:
+    """Форма обращения: «Савельева Мария» -> «Мария», «Иван Петрович Петров» -> «Иван Петрович»."""
+    first, patronymic, _ = person_parts(full)
+    if not first:
+        return (full or "").strip()
+    return f"{first} {patronymic}".strip()
+
+
+def _male_declensions(name: str) -> set[str]:
+    """Падежные формы мужских имён: Иван -> Ивана, Ивану, Иваном, Иване."""
+    forms: set[str] = set()
+    if name.endswith("й"):
+        stem = name[:-1]
+        forms.update({stem + "я", stem + "ю", stem + "ем", stem + "е"})
+    elif name.endswith("а"):
+        stem = name[:-1]
+        forms.update({stem + "ы", stem + "е", stem + "у", stem + "ой", stem + "ею"})
+    elif name.endswith("я"):
+        stem = name[:-1]
+        forms.update({stem + "и", stem + "е", stem + "ю", stem + "ей"})
+    elif name.endswith("ь"):
+        stem = name[:-1]
+        forms.update({stem + "я", stem + "ю", stem + "ем", stem + "е"})
+    else:
+        forms.update({name + "а", name + "у", name + "ом", name + "е"})
+    return forms - AMBIGUOUS_FORMS
+
+
+def _build_capitalize_names() -> frozenset[str]:
+    """
+    Словарь только для правки регистра имён.
+
+    Он шире словаря детектора: добавлены падежные формы мужских имён.
+    Детектор обезличивания его не использует — иначе «марка» или «нина»
+    в обычном тексте считались бы именами.
+    """
+    names: set[str] = set(FIRST_NAMES)
+    for name in MALE_NAMES:
+        names |= _male_declensions(name)
+    return frozenset(names)
+
+
+# Известные имена, написанные с маленькой буквы — считаем опечаткой клиента
+_LOWERCASE_NAME_RE = re.compile(
+    r"(?<![\w-])(?:" + "|".join(sorted(_build_capitalize_names(), key=len, reverse=True)) + r")(?![\w-])",
+    re.IGNORECASE,
+)
+
+
+def capitalize_names_in_text(text: str) -> str:
+    """Поднимает первую букву у известных имён, написанных с маленькой буквы."""
+
+    def replace(match: re.Match[str]) -> str:
+        word = match.group(0)
+        if word.islower() or (word.isupper() and len(word) > 1):
+            return capitalize_word(word)
+        return word
+
+    if not text:
+        return text
+    return _LOWERCASE_NAME_RE.sub(replace, text)
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +677,10 @@ def anonymize(text: str, known_values: Iterable[str] = ()) -> AnonymizationResul
             counters[span.kind] = counters.get(span.kind, 0) + 1
             token = f"[{span.kind}_{counters[span.kind]}]"
             by_value[key] = token
-            mapping[token] = original
+            # Имена сохраняем с большой буквы, даже если клиент написал с маленькой:
+            # «иван» -> «Иван». Иначе опечатка клиента разошлась бы по всей карточке.
+            value = canonical_name(original) if span.kind == "ИМЯ" else original
+            mapping[token] = value
             findings.append({"token": token, "type": TYPE_LABELS.get(span.kind, span.kind.lower())})
 
         pieces.append(text[position : span.start])

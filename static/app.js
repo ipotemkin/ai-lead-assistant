@@ -24,6 +24,15 @@ const errPhone = el('err-phone');
 const errEmail = el('err-email');
 const previewBody = el('llm-preview-body');
 const previewMeta = el('llm-preview-meta');
+const crmCheckbox = el('send-to-crm');
+const crmBlock = el('crm-block');
+const crmTitle = el('crm-title');
+const crmDetail = el('crm-detail');
+const crmLink = el('crm-link');
+const crmRetry = el('crm-retry');
+const crmErrors = el('crm-errors');
+const b24Report = el('b24-report');
+const resultTime = el('result-time');
 const errorBox = el('error-box');
 const resultBox = el('result');
 const spinner = el('spinner');
@@ -229,6 +238,156 @@ async function updatePreview() {
   }
 }
 
+/* --- Время обработки ----------------------------------------------------- */
+
+function formatSeconds(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return '';
+  if (number < 10) return `${number.toFixed(1).replace('.', ',')} с`;
+  return `${Math.round(number)} с`;
+}
+
+function renderTiming(timing, clientSeconds) {
+  if (!timing || !timing.total) {
+    resultTime.hidden = true;
+    return;
+  }
+  const parts = [`Обработка заняла ${formatSeconds(timing.total)}`];
+  if (timing.ai) parts.push(`AI ${formatSeconds(timing.ai)}`);
+  if (timing.crm) parts.push(`Битрикс24 ${formatSeconds(timing.crm)}`);
+  resultTime.textContent = parts.join(' · ');
+  resultTime.title = `Всего от нажатия «Обработать» до результата: ${formatSeconds(clientSeconds)}`;
+  resultTime.hidden = false;
+}
+
+/* --- Скрытие плашки проверки Битрикс24 ----------------------------------- */
+
+function hideB24Report() {
+  b24Report.hidden = true;
+  b24Report.textContent = '';
+}
+
+/* --- Блок отправки в CRM ----------------------------------------------- */
+
+function renderCrm(crm) {
+  crmBlock.hidden = false;
+  crmTitle.className = 'crm-title';
+  crmDetail.textContent = '';
+  crmErrors.textContent = '';
+  crmErrors.hidden = true;
+  crmLink.hidden = true;
+  crmRetry.hidden = true;
+
+  if (!crm) {
+    crmTitle.textContent = 'Отправка в Битрикс24 не выполнялась.';
+    return;
+  }
+
+  if (crm.sent && crm.lead_id) {
+    crmTitle.classList.add('ok');
+    crmTitle.textContent = `Отправлено в CRM: лид №${crm.lead_id}`;
+
+    const parts = [];
+    if (crm.comment_id) parts.push('комментарий в таймлайне');
+    if (crm.task_id) {
+      parts.push(crm.task_kind === 'activity' ? 'дело «Звонок» в таймлайне' : 'задача менеджеру');
+    }
+    if (crm.message_id) parts.push('уведомление в чат');
+    crmDetail.textContent = parts.length ? `Создано: ${parts.join(', ')}.` : '';
+
+    if (crm.lead_url) {
+      crmLink.href = crm.lead_url;
+      crmLink.hidden = false;
+    }
+  } else {
+    crmTitle.classList.add('fail');
+    crmTitle.textContent = 'Не удалось отправить в Битрикс24.';
+    crmRetry.hidden = false;
+  }
+
+  if (crm.errors && crm.errors.length) {
+    crmErrors.textContent = '';
+    crm.errors.forEach((message) => {
+      const item = document.createElement('li');
+      item.textContent = message;
+      crmErrors.appendChild(item);
+    });
+    crmErrors.hidden = false;
+    if (crm.sent) crmRetry.hidden = false;
+  }
+}
+
+async function retryCrm() {
+  if (!lastCard) return;
+  crmRetry.disabled = true;
+  crmTitle.textContent = 'Отправляю в Битрикс24…';
+  crmTitle.className = 'crm-title';
+  try {
+    const response = await fetch('/api/crm/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(lastCard),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      renderCrm({ sent: false, errors: [data.error || 'Ошибка отправки'] });
+      return;
+    }
+    lastCard.crm = data;
+    renderCrm(data);
+  } catch (err) {
+    renderCrm({ sent: false, errors: ['Нет связи с приложением.'] });
+  } finally {
+    crmRetry.disabled = false;
+  }
+}
+
+/* --- Диагностика Битрикс24 --------------------------------------------- */
+
+async function checkBitrix() {
+  b24Report.hidden = false;
+  b24Report.textContent = 'Проверяю Битрикс24…';
+  try {
+    const response = await fetch('/api/b24/check');
+    const data = await response.json();
+    b24Report.textContent = '';
+
+    const title = document.createElement('div');
+    title.textContent = data.configured
+      ? `Портал: ${data.portal}`
+      : 'Битрикс24 не настроен: не задан B24_URL в файле .env';
+    b24Report.appendChild(title);
+
+    const list = document.createElement('ul');
+    (data.checks || []).forEach((check) => {
+      const item = document.createElement('li');
+      const mark = document.createElement('span');
+      const level = check.level || (check.ok ? 'ok' : 'fail');
+      mark.className = level;
+      mark.textContent = level === 'ok' ? '✓ ' : (level === 'warn' ? '! ' : '✗ ');
+      item.appendChild(mark);
+      item.appendChild(document.createTextNode(`${check.name}: ${check.detail}`));
+      list.appendChild(item);
+    });
+    b24Report.appendChild(list);
+
+    if (data.chats && data.chats.length) {
+      const chats = document.createElement('ul');
+      const heading = document.createElement('li');
+      heading.textContent = 'Ваши чаты — значение из колонки DIALOG_ID впишите в B24_CHAT_ID:';
+      chats.appendChild(heading);
+      data.chats.forEach((chat) => {
+        const item = document.createElement('li');
+        item.textContent = `${chat.dialog_id} — ${chat.title || '(без названия)'}`;
+        chats.appendChild(item);
+      });
+      b24Report.appendChild(chats);
+    }
+  } catch (err) {
+    b24Report.textContent = 'Нет связи с приложением. Убедитесь, что сервер запущен.';
+  }
+}
+
 /* --- Проверка полей --------------------------------------------------- */
 
 function showFieldError(input, box, message) {
@@ -283,15 +442,17 @@ async function analyze() {
     return;
   }
 
+  hideB24Report();
   clearError();
   resultBox.hidden = true;
   setBusy(true);
+  const startedAt = performance.now();
 
   try {
     const response = await fetch('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(formPayload()),
+      body: JSON.stringify({ ...formPayload(), send_to_crm: crmCheckbox.checked }),
     });
 
     let data = null;
@@ -303,12 +464,15 @@ async function analyze() {
 
     if (!response.ok) {
       const message = (data && data.error) || `Ошибка сервера (HTTP ${response.status}).`;
-      showError(message);
+      const waited = formatSeconds((performance.now() - startedAt) / 1000);
+      showError(waited ? `${message} (ждали ${waited})` : message);
       return;
     }
 
     lastCard = data;
     renderCard(data);
+    renderCrm(data.crm);
+    renderTiming(data.timing, (performance.now() - startedAt) / 1000);
 
     // Показываем фактически отправленный текст (он обезличен)
     if (data.llm_request) {
@@ -325,7 +489,12 @@ async function analyze() {
 
     resultBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (err) {
-    showError('Нет связи с приложением. Убедитесь, что сервер запущен, и попробуйте ещё раз.');
+    const waited = formatSeconds((performance.now() - startedAt) / 1000);
+    showError(
+      `Нет связи с приложением. Убедитесь, что сервер запущен, и попробуйте ещё раз.${
+        waited ? ` (ждали ${waited})` : ''
+      }`
+    );
   } finally {
     setBusy(false);
   }
@@ -367,15 +536,27 @@ form.addEventListener('submit', (event) => {
 
 clearBtn.addEventListener('click', () => {
   form.reset();
+  crmCheckbox.checked = true;
   clearFieldError(requestInput, errRequest);
   clearFieldError(phoneInput, errPhone);
   clearFieldError(emailInput, errEmail);
   clearError();
+  hideB24Report();
   resultBox.hidden = true;
+  crmBlock.hidden = true;
+  resultTime.hidden = true;
   previewBody.textContent = 'Заполните форму — здесь появится текст, который увидит модель.';
   previewMeta.textContent = '';
   requestInput.focus();
 });
+
+// Плашка с проверкой Битрикс24 закрывается после любого действия пользователя
+form.addEventListener('input', hideB24Report);
+form.addEventListener('change', hideB24Report);
+form.addEventListener('submit', hideB24Report);
+
+crmRetry.addEventListener('click', retryCrm);
+el('b24-check-btn').addEventListener('click', checkBitrix);
 
 [requestInput, emailInput].forEach((input) => {
   input.addEventListener('input', () => {
@@ -401,10 +582,12 @@ requestInput.addEventListener('keydown', (event) => {
 });
 
 el('copy-card').addEventListener('click', (event) => {
+  hideB24Report();
   if (lastCard) copyText(cardToText(lastCard), event.currentTarget);
 });
 
 el('copy-reply').addEventListener('click', (event) => {
+  hideB24Report();
   if (lastCard) copyText(lastCard.reply_draft || 'не указано', event.currentTarget);
 });
 
