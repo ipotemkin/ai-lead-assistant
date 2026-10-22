@@ -19,6 +19,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -339,6 +340,106 @@ def _extract_id(result: Any, *paths: str) -> str:
     return ""
 
 
+def batch_command(method: str, params: dict[str, Any] | None = None) -> str:
+    """
+    Собирает подзапрос для batch: «метод?параметр=значение».
+
+    Вложенные объекты кодируются как fields[ENTITY_ID]=... — именно так их ждёт
+    Битрикс24, когда параметры передаются строкой, а не телом запроса.
+    """
+    if not params:
+        return method
+
+    parts: list[str] = []
+    for key, value in params.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                parts.append(f"{key}[{sub_key}]={quote(str(sub_value), safe='')}")
+        else:
+            parts.append(f"{key}={quote(str(value), safe='')}")
+    return f"{method}?{'&'.join(parts)}"
+
+
+async def call_batch(commands: dict[str, str]) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+    """
+    Выполняет несколько методов Битрикс24 за один HTTP-запрос.
+
+    commands — словарь {имя: "метод?параметры"}.
+    Возвращает (результаты, ошибки): ошибка одного подзапроса не мешает остальным.
+
+    Экономит время: четыре отдельных обращения к порталу занимают около двух секунд,
+    один пакет — около четырёхсот миллисекунд.
+    """
+    base = get_base_url()
+    if not base:
+        raise BitrixError("Битрикс24 не настроен: не задан B24_URL в файле .env.")
+
+    timer = logbuf.Timer()
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT)
+    ) as client:
+        try:
+            response = await client.post(
+                f"{base}batch.json",
+                json={"halt": 0, "cmd": commands},
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+        except httpx.TimeoutException:
+            logbuf.log(
+                "b24.error",
+                f"Битрикс24 не ответил за {int(REQUEST_TIMEOUT)} секунд.",
+                duration_ms=timer.ms,
+                level="error",
+                method="batch",
+            )
+            raise BitrixError(
+                f"Битрикс24 не ответил за {int(REQUEST_TIMEOUT)} секунд."
+            ) from None
+        except httpx.HTTPError:
+            logbuf.log(
+                "b24.error",
+                "Нет связи с Битрикс24",
+                duration_ms=timer.ms,
+                level="error",
+                method="batch",
+            )
+            raise BitrixError("Нет связи с Битрикс24. Проверьте интернет.") from None
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise BitrixError(
+            f"Битрикс24 вернул неожиданный ответ (HTTP {response.status_code})."
+        ) from None
+
+    if isinstance(data, dict) and "error" in data:
+        code = str(data.get("error") or "").strip()
+        description = str(data.get("error_description") or "").strip()
+        logbuf.log(
+            "b24.error",
+            _friendly_error(code, description),
+            duration_ms=timer.ms,
+            level="error",
+            method="batch",
+        )
+        raise BitrixError(_friendly_error(code, description), code=code)
+
+    payload = (data.get("result") or {}) if isinstance(data, dict) else {}
+    results = payload.get("result") or {}
+    errors = payload.get("result_error") or {}
+
+    logbuf.log(
+        "b24.batch",
+        f"Пакет из {len(commands)} методов выполнен",
+        duration_ms=timer.ms,
+        method="batch",
+        calls=len(commands),
+        ok=len(results),
+        errors=len(errors) or 0,
+    )
+    return results, errors
+
+
 async def call(method: str, params: dict[str, Any] | None = None) -> Any:
     """Вызывает метод вебхука и возвращает поле result.
 
@@ -504,22 +605,93 @@ async def create_lead(card: dict[str, Any]) -> int:
     return int(lead_id)
 
 
-async def add_comment(lead_id: int, card: dict[str, Any]) -> int:
-    """Добавляет карточку лида комментарием в таймлайн."""
-    result = await call(
-        "crm.timeline.comment.add",
-        {
-            "fields": {
-                "ENTITY_ID": lead_id,
-                "ENTITY_TYPE": "lead",
-                "COMMENT": card_to_text(card),
-            }
-        },
-    )
-    comment_id = _extract_id(result, "item.id")
-    if not comment_id:
-        raise BitrixError("Битрикс24 не вернул идентификатор комментария.")
-    return int(comment_id)
+def notification_text(lead_id: int, card: dict[str, Any]) -> str:
+    """Текст уведомления в чат."""
+    key_data = card.get("key_data") or {}
+    lines = [
+        "[B]Новая заявка с сайта[/B]",
+        f"Тип: {LEAD_TYPE_TITLE.get(str(card.get('lead_type') or ''), 'заявка')}",
+        f"Компания: {key_data.get('company', 'не указано')}",
+        f"Контакт: {key_data.get('contact', 'не указано')}",
+        f"Суть: {card.get('summary', 'не указано')}",
+    ]
+    if card.get("needs_human"):
+        lines.append(f"[B]Нужен человек:[/B] {card.get('human_reason', '')}")
+    lines.append(f"Следующий шаг: {card.get('next_step', 'не указано')}")
+
+    url = lead_url(lead_id)
+    if url:
+        lines.append(f"[URL={url}]Открыть лид[/URL]")
+    return "\n".join(lines)
+
+
+def _batch_value(result: Any) -> Any:
+    """В пакете результат подзапроса лежит внутри поля result."""
+    if isinstance(result, dict) and "result" in result:
+        return result["result"]
+    return result
+
+
+def _error_text(error: Any) -> str:
+    """Человекочитаемый текст ошибки подзапроса из пакета."""
+    if isinstance(error, dict):
+        return str(error.get("error_description") or error.get("error") or "неизвестная ошибка")
+    return str(error)
+
+
+async def add_comment_and_notify(
+    lead_id: int, card: dict[str, Any]
+) -> tuple[int | None, int | None, list[str]]:
+    """
+    Добавляет комментарий в таймлайн и отправляет уведомление в чат.
+
+    Обе операции уходят одним пакетом batch — это вчетверо быстрее двух
+    отдельных обращений к порталу.
+
+    Возвращает (id комментария, id сообщения, список ошибок).
+    """
+    commands: dict[str, str] = {
+        "comment": batch_command(
+            "crm.timeline.comment.add",
+            {
+                "fields": {
+                    "ENTITY_ID": lead_id,
+                    "ENTITY_TYPE": "lead",
+                    "COMMENT": card_to_text(card),
+                }
+            },
+        )
+    }
+
+    chat_id = get_chat_id()
+    if chat_id:
+        commands["message"] = batch_command(
+            "im.message.add",
+            {
+                "DIALOG_ID": chat_id,
+                "MESSAGE": notification_text(lead_id, card),
+                "SYSTEM": "N",
+                "URL_PREVIEW": "N",
+            },
+        )
+
+    results, errors = await call_batch(commands)
+
+    comment_id: int | None = None
+    message_id: int | None = None
+    problems: list[str] = []
+
+    if results.get("comment") is not None:
+        comment_id = int(_extract_id(_batch_value(results["comment"]), "item.id") or 0) or None
+    if "comment" in errors:
+        problems.append(f"Комментарий не добавлен: {_error_text(errors['comment'])}")
+
+    if results.get("message") is not None:
+        message_id = int(_extract_id(_batch_value(results["message"]), "item.id") or 0) or None
+    if "message" in errors:
+        problems.append(f"Уведомление не отправлено: {_error_text(errors['message'])}")
+
+    return comment_id, message_id, problems
 
 
 async def create_task(lead_id: int, card: dict[str, Any]) -> dict[str, str]:
@@ -601,40 +773,3 @@ async def create_activity_task(lead_id: int, card: dict[str, Any]) -> str:
 
     result = await call("crm.activity.add", {"fields": fields})
     return _extract_id(result, "item.id")
-
-
-async def notify(lead_id: int, card: dict[str, Any]) -> int:
-    """Отправляет уведомление о новой заявке в чат."""
-    chat_id = get_chat_id()
-    if not chat_id:
-        raise BitrixError("Не задан чат для уведомлений: укажите B24_CHAT_ID в файле .env.")
-
-    key_data = card.get("key_data") or {}
-    lines = [
-        "[B]Новая заявка с сайта[/B]",
-        f"Тип: {LEAD_TYPE_TITLE.get(str(card.get('lead_type') or ''), 'заявка')}",
-        f"Компания: {key_data.get('company', 'не указано')}",
-        f"Контакт: {key_data.get('contact', 'не указано')}",
-        f"Суть: {card.get('summary', 'не указано')}",
-    ]
-    if card.get("needs_human"):
-        lines.append(f"[B]Нужен человек:[/B] {card.get('human_reason', '')}")
-    lines.append(f"Следующий шаг: {card.get('next_step', 'не указано')}")
-
-    url = lead_url(lead_id)
-    if url:
-        lines.append(f"[URL={url}]Открыть лид[/URL]")
-
-    result = await call(
-        "im.message.add",
-        {
-            "DIALOG_ID": chat_id,
-            "MESSAGE": "\n".join(lines),
-            "SYSTEM": "N",
-            "URL_PREVIEW": "N",
-        },
-    )
-    message_id = _extract_id(result, "item.id")
-    if not message_id:
-        raise BitrixError("Битрикс24 не вернул идентификатор сообщения.")
-    return int(message_id)

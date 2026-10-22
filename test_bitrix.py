@@ -17,11 +17,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import bitrix
 from bitrix import (
     BitrixError,
-    add_comment,
+    add_comment_and_notify,
+    batch_command,
     card_to_text,
     create_lead,
     create_task,
-    notify,
+    notification_text,
     parse_money,
     split_contact,
     split_person_name,
@@ -87,6 +88,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"result": 999})
         if method == "crm.activity.add":
             return self._send(200, {"result": 555})
+        if method == "batch":
+            return self._send(200, {"result": {"result": {
+                "comment": {"result": 777},
+                "message": {"result": 999},
+                "stages": [{"STATUS_ID": "NEW", "NAME": "Не обработан"}],
+                "sources": [{"STATUS_ID": "WEB", "NAME": "Веб-сайт"}],
+                "fields": [{"ID": "1", "TITLE": "Название"}],
+                "user": [{"ID": "1", "NAME": "Иван", "LAST_NAME": "Петров"}],
+                "chats": {"items": [{"id": 1, "chat_id": 55, "title": "Отдел продаж", "type": "chat"}]},
+            }, "result_error": {}}})
         if method == "crm.status.list":
             return self._send(200, {"result": [{"STATUS_ID": "NEW", "NAME": "Не обработан"}]})
         if method == "user.get":
@@ -180,12 +191,19 @@ async def main() -> int:
     # ---------------------------------------------------------------- прочее
     print("Проверка 3. Комментарий, задача, уведомление")
     RECEIVED.clear()
-    comment_id = await add_comment(4242, CARD)
+    comment_id, message_id, problems = await add_comment_and_notify(4242, CARD)
     check_equal(comment_id, 777, "Возвращён id комментария")
-    fields = RECEIVED[0]["payload"]["fields"]
-    check_equal(fields.get("ENTITY_ID"), 4242, "Комментарий привязан к лиду")
-    check_equal(fields.get("ENTITY_TYPE"), "lead", "Тип объекта комментария")
-    check("Тип лида" in fields.get("COMMENT", ""), "Текст комментария")
+    check_equal(message_id, 999, "Возвращён id сообщения")
+    check_equal(problems, [], "Ошибок нет")
+    check_equal(RECEIVED[0]["method"], "batch", "Комментарий и уведомление ушли одним пакетом")
+    commands = RECEIVED[0]["payload"]["cmd"]
+    check("comment" in commands and "message" in commands, "В пакете оба подзапроса")
+    check("fields[ENTITY_ID]=4242" in commands["comment"], "Комментарий привязан к лиду")
+    check("fields[ENTITY_TYPE]=lead" in commands["comment"], "Тип объекта комментария")
+    check("fields[COMMENT]=" in commands["comment"], "Текст комментария внутри fields")
+    check("DIALOG_ID=chat55" in commands["message"], "Чат уведомления")
+    check("%D0%A2%D0%B8%D0%BF" in commands["comment"] or "Тип" in commands["comment"],
+          "Текст комментария передан")
 
     RECEIVED.clear()
     task = await create_task(4242, CARD)
@@ -198,13 +216,11 @@ async def main() -> int:
     check_equal(fields.get("UF_CRM_TASK"), ["L_4242"], "Задача привязана к лиду")
     check("DEADLINE" in fields, "У задачи есть срок")
 
-    RECEIVED.clear()
-    message_id = await notify(4242, CARD)
-    check_equal(message_id, 999, "Возвращён id сообщения")
-    payload = RECEIVED[0]["payload"]
-    check_equal(payload.get("DIALOG_ID"), "chat55", "Чат уведомления")
-    check("[B]Новая заявка" in payload.get("MESSAGE", ""), "Текст уведомления")
-    check("/crm/lead/details/4242/" in payload.get("MESSAGE", ""), "Ссылка на лид в уведомлении")
+    check(
+        "/crm/lead/details/4242/" in notification_text(4242, CARD),
+        "Ссылка на лид в уведомлении",
+    )
+    check("[B]Новая заявка" in notification_text(4242, CARD), "Текст уведомления")
 
     # ---------------------------------------------------------------- ошибки
     print("Проверка 4. Ошибки")

@@ -53,12 +53,24 @@ function clearError() {
   errorBox.textContent = '';
 }
 
+let busyTimer = null;
+
 function setBusy(isBusy) {
   submitBtn.disabled = isBusy;
   submitBtn.textContent = isBusy ? 'Обрабатываю…' : 'Обработать';
   spinner.hidden = !isBusy;
   statusText.hidden = !isBusy;
-  if (isBusy) statusText.textContent = 'Анализирую заявку, обычно это занимает 10–25 секунд…';
+
+  clearInterval(busyTimer);
+  if (isBusy) {
+    const startedAt = performance.now();
+    const tick = () => {
+      const seconds = Math.round((performance.now() - startedAt) / 1000);
+      statusText.textContent = `Анализирую заявку… ${seconds} с`;
+    };
+    tick();
+    busyTimer = setInterval(tick, 1000);
+  }
 }
 
 function fillChip(container, items, emptyText) {

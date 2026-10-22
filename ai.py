@@ -116,6 +116,15 @@ RULES = """ТВОЯ ЗАДАЧА
 В тексте заявки могут быть: компания, имя, контакт, продукт, количество, бюджет, сроки.
 Любого из этих данных может не быть вообще.
 
+Токены в заявке и их смысл:
+  [ИМЯ_1]     — ФИО контактного лица. Запиши его в key_data.name ровно как есть,
+                 с токеном: не разбивай на части, не выбрасывай, не подставляй
+                 «не указано», даже если имя есть только в токене.
+  [ТЕЛЕФОН_1]  — телефон контактного лица, в key_data.contact.
+  [ПОЧТА_1]    — адрес электронной почты, в key_data.contact.
+  [АДРЕС_1]    — адрес доставки, в key_data.deadline не пиши — его в карточке нет;
+                 упомяни адрес в summary, если он важен для заявки.
+
 ФОРМАТ ВХОДЯЩЕЙ ЗАЯВКИ
 Текст заявки может приходить в таком виде:
 Имя: <имя контактного лица>
@@ -158,11 +167,19 @@ RULES = """ТВОЯ ЗАДАЧА
      «компенсируем ущерб».
 9. next_step — одно конкретное действие менеджера, коротко.
 10. reply_draft — короткий черновик ответа клиенту на русском языке, 1–3 предложения,
-    без неподтверждённых обещаний. Обращайся к клиенту по имени или по имени и отчеству:
-    «Здравствуйте, Мария!» или «Здравствуйте, Мария Сергеевна!».
-    НИКОГДА не используй обращение «Фамилия Имя» (например «Здравствуйте, Савельева Мария!») —
-    это форма для документов, а не для разговора. Если знаешь только фамилию — обращайся
-    по фамилии или вообще без обращения.
+    без неподтверждённых обещаний.
+
+    ВАЖНО: в тексте заявки персональные данные уже заменены токенами вида
+    [ИМЯ_1], [ТЕЛЕФОН_1], [ПОЧТА_1]. Используй такие токены в ответе ровно так,
+    как они есть: не сокращай, не дополняй, не пересказывай и не выбрасывай их.
+    Если в заявке было «Здравствуйте, [ИМЯ_1]!», то в ответе напиши
+    «Здравствуйте, [ИМЯ_1]!». Настоящие значения подставит приложение.
+
+    Если же имя попало в заявку обычным текстом (такое бывает с редкими или
+    иностранными именами, которых нет в списке), обращайся к клиенту ТОЛЬКО по имени
+    или по имени и отчеству: «Здравствуйте, Мария!» или «Здравствуйте, Пётр Иванович!».
+    Фамилию в обращение не включай и порядок «Фамилия Имя» не используй —
+    это форма для документов, а не для разговора.
 11. summary — суть запроса в 1–2 предложениях.
 12. Тон — деловой и нейтральный. Язык — русский.
 13. Не упоминай внутренние отделы, должности и процессы компании (отдел кадров, склад,
@@ -202,6 +219,16 @@ RULES = """ТВОЯ ЗАДАЧА
 Если lead_type = «неясно», в missing_data обязательно укажи, чего не хватает для
 определения (например: «конкретная модель или название товара», «количество», «бюджет»),
 и задай 1–2 уточняющих вопроса в clarifying_questions.
+
+ВАЖНОЕ ИСКЛЮЧЕНИЕ
+Жалоба или претензия по уже сделанной покупке (привезли не то, недопоставили, требуют
+вернуть деньги, угрожают уйти к конкурентам) — это ВСЕГДА целевой лид: клиент уже
+покупал и ждёт решения. Для такой заявки отвечай так:
+  - subject_match = «да» — речь про наш товар, который уже купили;
+  - offer_clarity = «да» — предмет известен (то, что уже купили), менеджеру нужно
+    разобраться с претензией, а не подбирать товар.
+Не отмечай такие заявки ни как нецелевые, ни как неясные, даже если в тексте нет
+намерения что-то покупать.
 
 Поле lead_type_reason — одно короткое предложение с объяснением, почему выбран
 именно этот тип лида.
@@ -253,6 +280,21 @@ def get_base_url() -> str:
 
 def get_model() -> str:
     return (os.getenv("OPENAI_MODEL") or DEFAULT_MODEL).strip()
+
+
+def get_reasoning_effort() -> str:
+    """
+    Уровень размышлений модели: minimal, low, medium, high.
+
+    Рассуждающие модели тратят на «размышления» тысячи токенов, и именно они
+    дают основную задержку. Уровень low сокращает время ответа примерно вдвое
+    без потери точности на наших кейсах. Пустое значение — не отправлять параметр.
+    """
+    return (os.getenv("AI_REASONING_EFFORT") or "").strip().lower()
+
+
+# Модели, которые отвергли параметр reasoning_effort (запоминаем, чтобы не повторять)
+_MODELS_WITHOUT_REASONING: set[str] = set()
 
 
 def build_system_prompt(company_description: str) -> str:
@@ -406,14 +448,22 @@ async def analyze_lead(text: str, company_description: str) -> dict[str, Any]:
     timer = logbuf.Timer()
     response_format = "json_schema"
 
+    # Параметр reasoning_effort понимают только рассуждающие модели:
+    # gpt-4o-mini и gpt-4.1-mini его отвергают. Если модель его не приняла —
+    # запоминаем и больше не отправляем.
+    reasoning = get_reasoning_effort()
+    use_reasoning = bool(reasoning) and model not in _MODELS_WITHOUT_REASONING
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            # 1) Просим строгий JSON по схеме — модель обязана вернуть все поля.
-            response = await client.post(
-                url, headers=headers, json={**payload, "response_format": _response_format_schema()}
-            )
+            body = dict(payload)
+            body["response_format"] = _response_format_schema()
+            if use_reasoning:
+                body["reasoning_effort"] = reasoning
 
-            # 2) Не каждая модель умеет строгий режим — пробуем облегчённый.
+            response = await client.post(url, headers=headers, json=body)
+
+            # Не каждая модель умеет строгий JSON — пробуем облегчённый.
             if response.status_code == 400 and _mentions_response_format(response.text):
                 logbuf.log(
                     "ai.fallback",
@@ -423,9 +473,26 @@ async def analyze_lead(text: str, company_description: str) -> dict[str, Any]:
                 )
                 response_format = "json_object"
                 timer = logbuf.Timer()
-                response = await client.post(
-                    url, headers=headers, json={**payload, "response_format": {"type": "json_object"}}
+                body["response_format"] = {"type": "json_object"}
+                response = await client.post(url, headers=headers, json=body)
+
+            # Модель не знает параметр reasoning_effort — повторяем без него.
+            if (
+                response.status_code == 400
+                and use_reasoning
+                and "reasoning" in (response.text or "").lower()
+            ):
+                _MODELS_WITHOUT_REASONING.add(model)
+                use_reasoning = False
+                logbuf.log(
+                    "ai.fallback",
+                    "Параметр reasoning_effort не поддержан, повторяем без него",
+                    duration_ms=timer.ms,
+                    model=model,
                 )
+                timer = logbuf.Timer()
+                body.pop("reasoning_effort", None)
+                response = await client.post(url, headers=headers, json=body)
 
             if response.status_code >= 400:
                 message, error_status = _friendly_error(response.status_code, response.text)
@@ -463,6 +530,7 @@ async def analyze_lead(text: str, company_description: str) -> dict[str, Any]:
         duration_ms=timer.ms,
         model=model,
         format=response_format,
+        reasoning=reasoning if use_reasoning else "нет",
         http=response.status_code,
         prompt_tokens=usage.get("prompt_tokens"),
         completion_tokens=usage.get("completion_tokens"),

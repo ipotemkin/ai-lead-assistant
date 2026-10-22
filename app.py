@@ -11,6 +11,7 @@ AI-помощник для первичной обработки заявок.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import socket
@@ -42,8 +43,9 @@ from anonymizer import (
 )
 from bitrix import (
     BitrixError,
-    add_comment,
+    add_comment_and_notify,
     call as bitrix_call,
+    call_batch as bitrix_batch,
     create_lead,
     create_task,
     get_chat_id,
@@ -51,7 +53,6 @@ from bitrix import (
     get_portal_url,
     get_source_id,
     lead_url,
-    notify,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -442,17 +443,20 @@ def restore_card(card: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any
     return walk(card)
 
 
+# Приветствие и имя после него. Имя — до трёх слов: «Иван», «Иван Петрович»,
+# «Иван Петрович Нервный» — чтобы заменить ФИО целиком, вместе с фамилией.
 _GREETING_RE = re.compile(
-    r"(?i)\b(здравствуй\w*|добрый\s+день|доброе\s+утро|добрый\s+вечер|привет\w*)\s*,\s*"
-    r"((?:[А-ЯЁ][а-яёA-Za-z-]+)(?:\s+[А-ЯЁ][а-яёA-Za-z-]+)?)"
+    r"\b((?i:здравствуй\w*|добрый\s+день|доброе\s+утро|добрый\s+вечер|привет\w*))\s*,\s*"
+    r"([А-ЯЁA-Z][а-яёA-Za-z-]+(?:\s+[А-ЯЁA-Z][а-яёA-Za-z-]+){0,2})"
 )
 
 
 def fix_greeting_name(text: str, raw_name: str) -> str:
     """
-    В приветствии обращаемся по имени, а не «Фамилия Имя».
+    В приветствии обращаемся по имени и отчеству, без фамилии.
 
     «Здравствуйте, Савельева Мария!» -> «Здравствуйте, Мария!»
+    «Здравствуйте, Петр Иванович Нервный!» -> «Здравствуйте, Петр Иванович!»
     """
     if not text or not raw_name:
         return text
@@ -465,12 +469,20 @@ def fix_greeting_name(text: str, raw_name: str) -> str:
     first = capitalize_word(first)
     patronymic = capitalize_word(patronymic)
     address = f"{first} {patronymic}".strip()
-    variants = {
-        " ".join(part for part in (first, patronymic, surname) if part).lower(),
-        " ".join(part for part in (surname, first) if part).lower(),
-        first.lower(),
-        address.lower(),
-    }
+    # Все разумные порядки ФИО, которые встречаются в приветствии:
+    # «Иван», «Иван Петрович», «Иван Петрович Нервный», «Нервный Иван Петрович».
+    parts = [part for part in (first, patronymic, surname) if part]
+    variants: set[str] = set()
+    if parts:
+        variants.add(" ".join(parts).lower())
+    if first and surname:
+        variants.add(" ".join(part for part in (surname, first) if part).lower())
+        if patronymic:
+            variants.add(" ".join(part for part in (surname, first, patronymic) if part).lower())
+    if first and patronymic:
+        variants.add(" ".join(part for part in (first, patronymic) if part).lower())
+    variants.add(first.lower())
+    variants.add(address.lower())
     variants.discard("")
 
     def replace(match: re.Match[str]) -> str:
@@ -865,27 +877,38 @@ async def push_to_crm(card: dict[str, Any]) -> dict[str, Any]:
     result["lead_id"] = lead_id
     result["lead_url"] = lead_url(lead_id)
 
-    try:
-        result["comment_id"] = await add_comment(lead_id, card)
-    except BitrixError as exc:
-        result["errors"].append(f"Комментарий не добавлен: {exc.message}")
+    # Комментарий с уведомлением уходят одним пакетом, задача создаётся
+    # параллельно — ждать по очереди не нужно.
+    async def make_task() -> tuple[str, str, str | None]:
+        try:
+            task = await create_task(lead_id, card)
+            return ("task", task.get("id") or "", task.get("kind") or "task")
+        except BitrixError as exc:
+            return ("error", "", exc.message)
 
-    try:
-        task = await create_task(lead_id, card)
-        result["task_id"] = task.get("id") or ""
-        result["task_kind"] = task.get("kind") or "task"
-        if task.get("kind") == "activity":
-            result["errors"].append(
-                "У вебхука нет прав на раздел «Задачи» — вместо задачи создано дело «Звонок» в таймлайне лида."
-            )
-    except BitrixError as exc:
-        result["errors"].append(f"Задача не создана: {exc.message}")
+    async def make_comment_and_notify() -> tuple[int | None, int | None, list[str]]:
+        try:
+            return await add_comment_and_notify(lead_id, card)
+        except BitrixError as exc:
+            return (None, None, [f"Комментарий и уведомление не отправлены: {exc.message}"])
 
-    try:
-        result["message_id"] = await notify(lead_id, card)
-    except BitrixError as exc:
-        result["errors"].append(f"Уведомление не отправлено: {exc.message}")
+    (task_kind, task_id, task_error), (comment_id, message_id, problems) = await asyncio.gather(
+        make_task(), make_comment_and_notify()
+    )
 
+    result["comment_id"] = comment_id
+    result["message_id"] = message_id
+    result["task_id"] = task_id
+    result["task_kind"] = task_kind if task_kind == "task" else ""
+
+    if task_kind == "error":
+        result["errors"].append(f"Задача не создана: {task_error}")
+    elif task_kind == "activity":
+        result["errors"].append(
+            "У вебхука нет прав на раздел «Задачи» — вместо задачи создано дело «Звонок» в таймлайне лида."
+        )
+
+    result["errors"].extend(problems)
     return result
 
 
@@ -954,38 +977,78 @@ async def b24_check() -> dict[str, Any]:
         add_check("Адрес вебхука", False, "fail", "Не задан B24_URL в файле .env")
         return report
 
-    # 1. Вебхук и справочник стадий лида
-    stages = await probe(
-        "Вебхук и доступ к CRM",
-        lambda: bitrix_call(
-            "crm.status.list", {"filter": {"ENTITY_ID": "STATUS"}, "order": {"SORT": "ASC"}}
-        ),
-        lambda items: f"доступно стадий лида: {len(items or [])}",
-    )
-    if stages is None:
+    # Все проверки — одним пакетом: пять обращений к порталу занимают около
+    # двух секунд, один пакет — около четырёхсот миллисекунд.
+    async def batch_probe() -> dict[str, Any]:
+        results, errors = await bitrix_batch(
+            {
+                "stages": "crm.status.list?filter[ENTITY_ID]=STATUS",
+                "sources": "crm.status.list?filter[ENTITY_ID]=SOURCE",
+                "fields": "tasks.task.getFields",
+                "user": f"user.get?ID={get_manager_id() or 1}",
+                "chats": "im.recent.list?LIMIT=10&SKIP_OPENLINES=Y&UNREAD_ONLY=N&PARSE_TEXT=N",
+            }
+        )
+        return {"results": results, "errors": errors}
+
+    try:
+        probe_data = await batch_probe()
+    except BitrixError as exc:
+        add_check("Портал Битрикс24", False, "fail", exc.message)
         return report
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            "Портал Битрикс24", False, "fail", f"ошибка проверки: {type(exc).__name__}: {exc}"
+        )
+        return report
+
+    batch_results = probe_data.get("results") or {}
+    batch_errors = probe_data.get("errors") or {}
+
+    def batch_ok(name: str) -> bool:
+        return name in batch_results and name not in batch_errors
+
+    stages = batch_results.get("stages") or []
     report["lead_stages"] = [
-        {"id": item.get("STATUS_ID"), "name": item.get("NAME")} for item in stages or []
+        {"id": item.get("STATUS_ID"), "name": item.get("NAME")} for item in stages
     ]
-
-    # 2. Источники
-    sources = await probe(
-        "Источники лидов",
-        lambda: bitrix_call(
-            "crm.status.list", {"filter": {"ENTITY_ID": "SOURCE"}, "order": {"SORT": "ASC"}}
-        ),
-        lambda items: f"доступно источников: {len(items or [])}",
+    add_check(
+        "Вебхук и доступ к CRM",
+        batch_ok("stages"),
+        "ok" if batch_ok("stages") else "fail",
+        f"доступно стадий лида: {len(stages)}",
     )
-    if sources is not None:
-        report["sources"] = [
-            {"id": item.get("STATUS_ID"), "name": item.get("NAME")} for item in sources or []
-        ]
+    if batch_errors:
+        add_check(
+            "Ошибки проверки",
+            False,
+            "warn",
+            "; ".join(f"{name}: {error.get('error_description') or error.get('error')}"
+                      for name, error in batch_errors.items()),
+        )
 
-    # 3. Права на задачи (метод только читает — задачу не создаёт)
-    await probe(
+    sources = batch_results.get("sources") or []
+    report["sources"] = [
+        {"id": item.get("STATUS_ID"), "name": item.get("NAME")} for item in sources
+    ]
+    add_check(
+        "Источники лидов",
+        batch_ok("sources"),
+        "ok" if batch_ok("sources") else "fail",
+        f"доступно источников: {len(sources)}",
+    )
+
+    add_check(
         "Права на задачи",
-        lambda: bitrix_call("tasks.task.getFields", {}),
-        lambda _: "раздел «Задачи» доступен, задачи будут создаваться",
+        batch_ok("fields"),
+        "ok" if batch_ok("fields") else "fail",
+        (
+            "раздел «Задачи» доступен, задачи будут создаваться"
+            if batch_ok("fields")
+            else "у вебхука нет прав на задачи — нужен скоуп «Задачи (task)», "
+            "а не устаревший «Задачи (tasks)». Лид, комментарий и дело "
+            "«Звонок» в таймлайне при этом создаются."
+        ),
     )
 
     # 4. Ответственный
@@ -998,13 +1061,10 @@ async def b24_check() -> dict[str, Any]:
             "Не удалось определить ID: задайте B24_MANAGER_ID в файле .env",
         )
     else:
-        try:
-            user = await bitrix_call("user.get", {"ID": int(manager_id)})
-            # user.get возвращает массив пользователей
-            if isinstance(user, list):
-                user = user[0] if user else {}
-            if not isinstance(user, dict):
-                user = {}
+        user = batch_results.get("user")
+        if isinstance(user, list):
+            user = user[0] if user else {}
+        if isinstance(user, dict) and user:
             full_name = " ".join(
                 part
                 for part in [user.get("NAME"), user.get("LAST_NAME")]
@@ -1016,77 +1076,52 @@ async def b24_check() -> dict[str, Any]:
                 "ok",
                 f"ID {manager_id} — {full_name or 'имя в профиле не заполнено'}",
             )
-        except BitrixError as exc:
-            # Проверить имя не вышло — это не мешает создавать задачи.
-            if "прав" in exc.message.lower():
-                detail = (
-                    f"ID {manager_id} — у вебхука нет прав на просмотр пользователей. "
-                    "Созданию задач это не мешает."
-                )
-            else:
-                detail = f"ID {manager_id} — не удалось проверить: {exc.message}"
-            add_check("Ответственный", True, "warn", detail)
-        except Exception as exc:  # noqa: BLE001
+        else:
             add_check(
                 "Ответственный",
                 True,
                 "warn",
-                f"ID {manager_id} — не удалось проверить: {type(exc).__name__}: {exc}",
+                f"ID {manager_id} — у вебхука нет прав на просмотр пользователей. "
+                "Созданию задач это не мешает.",
             )
 
     # 5. Чаты для уведомлений
-    chats = await probe(
+    chats = batch_results.get("chats")
+    items = chats.get("items", []) if isinstance(chats, dict) else []
+    report["chats"] = [
+        {
+            "id": str(item.get("chat_id") or item.get("id") or ""),
+            "dialog_id": _dialog_id(item),
+            "title": item.get("title") or "",
+            "type": item.get("type") or "",
+        }
+        for item in items
+    ]
+    add_check(
         "Список чатов",
-        lambda: bitrix_call(
-            "im.recent.list",
-            {"LIMIT": 10, "SKIP_OPENLINES": "Y", "UNREAD_ONLY": "N", "PARSE_TEXT": "N"},
-        ),
-        lambda result: (
-            f"доступно чатов: {len(result.get('items', []))}"
-            if isinstance(result, dict)
-            else "список получен"
-        ),
-        level="warn",
+        bool(items),
+        "ok" if items else "warn",
+        f"доступно чатов: {len(items)}",
     )
-    if chats is not None:
-        items = chats.get("items", []) if isinstance(chats, dict) else []
-        report["chats"] = [
-            {
-                "id": str(item.get("chat_id") or item.get("id") or ""),
-                "dialog_id": _dialog_id(item),
-                "title": item.get("title") or "",
-                "type": item.get("type") or "",
-            }
-            for item in items
-        ]
-        configured_chat = get_chat_id()
-        if configured_chat:
-            found = any(chat["dialog_id"] == configured_chat for chat in report["chats"])
-            add_check(
-                "Чат для уведомлений",
-                found,
-                "ok" if found else "fail",
-                f"B24_CHAT_ID = {configured_chat}"
-                if found
-                else f"чат {configured_chat} не найден в списке чатов",
-            )
-        else:
-            add_check(
-                "Чат для уведомлений",
-                False,
-                "warn",
-                "Не задан B24_CHAT_ID: уведомления отключены, выберите чат из списка",
-            )
+
+    configured_chat = get_chat_id()
+    if configured_chat:
+        found = any(chat["dialog_id"] == configured_chat for chat in report["chats"])
+        add_check(
+            "Чат для уведомлений",
+            found,
+            "ok" if found else "fail",
+            f"B24_CHAT_ID = {configured_chat}"
+            if found
+            else f"чат {configured_chat} не найден в списке чатов",
+        )
     else:
-        # Проверка чатов провалилась — сообщаем про чат отдельно
-        configured_chat = get_chat_id()
-        if not configured_chat:
-            add_check(
-                "Чат для уведомлений",
-                False,
-                "warn",
-                "Не задан B24_CHAT_ID: уведомления отключены",
-            )
+        add_check(
+            "Чат для уведомлений",
+            False,
+            "warn",
+            "Не задан B24_CHAT_ID: уведомления отключены, выберите чат из списка",
+        )
 
     return report
 
@@ -1254,13 +1289,16 @@ async def validation_error_handler(_: Request, exc: RequestValidationError) -> J
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     """Логируем запросы к несуществующим адресам — так видно, кто стучится."""
     if exc.status_code == 404:
-        agent = request.headers.get("user-agent") or "не указан"
-        print(
-            f"[404] Неизвестный адрес: {request.method} {request.url.path} "
-            f"(User-Agent: {agent})",
-            file=sys.stderr,
-            flush=True,
-        )
+        # /v1/* — это автоопределение локальных OpenAI-совместимых серверов
+        # (opencode, расширения браузера). Такие пробы шумят в логе, пропускаем.
+        if not request.url.path.startswith("/v1/"):
+            agent = request.headers.get("user-agent") or "не указан"
+            print(
+                f"[404] Неизвестный адрес: {request.method} {request.url.path} "
+                f"(User-Agent: {agent})",
+                file=sys.stderr,
+                flush=True,
+            )
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": "Адрес не найден. Приложение доступно на /, /api/analyze и /health."},

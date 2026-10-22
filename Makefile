@@ -16,7 +16,7 @@ STAMP  := $(VENV)/.deps_ok
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup run test clean
+.PHONY: help setup run test check-quality clean
 
 help: ## Показать список команд
 	@echo ""
@@ -49,6 +49,9 @@ test: setup ## Проверить обезличивание, интеграци
 	@$(BIN)/python test_anonymizer.py
 	@$(BIN)/python test_bitrix.py
 	@$(BIN)/python test_log.py
+
+check-quality: setup ## Проверить качество и скорость классификации на эталонных заявках
+	@$(BIN)/python check_quality.py
 
 clean: ## Удалить кэши Python
 	@rm -rf __pycache__ */__pycache__

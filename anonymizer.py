@@ -121,11 +121,33 @@ def _female_declensions(name: str) -> set[str]:
     """Падежные формы женских имён: Мария -> Марии, Анна -> Анны."""
     forms: set[str] = set()
     if name.endswith("а"):
-        forms.update({name[:-1] + "ы", name[:-1] + "е"})
+        # Анна -> Анны, Анне, Анну, Анной
+        forms.update({name[:-1] + "ы", name[:-1] + "е", name[:-1] + "у", name[:-1] + "ой"})
     elif name.endswith("я"):
-        forms.update({name[:-1] + "и", name[:-1] + "е"})
+        # Мария -> Марии, Марию, Марией
+        forms.update({name[:-1] + "и", name[:-1] + "е", name[:-1] + "ю", name[:-1] + "ей"})
     elif name.endswith("ия"):
-        forms.update({name[:-2] + "ии", name[:-2] + "ие"})
+        forms.update({name[:-2] + "ии", name[:-2] + "ие", name[:-2] + "ию"})
+    return forms - AMBIGUOUS_FORMS
+
+
+def _male_declensions(name: str) -> set[str]:
+    """Падежные формы мужских имён: Иван -> Ивана, Ивану, Иваном, Иване."""
+    forms: set[str] = set()
+    if name.endswith("й"):
+        stem = name[:-1]
+        forms.update({stem + "я", stem + "ю", stem + "ем", stem + "е"})
+    elif name.endswith("а"):
+        stem = name[:-1]
+        forms.update({stem + "ы", stem + "е", stem + "у", stem + "ой", stem + "ею"})
+    elif name.endswith("я"):
+        stem = name[:-1]
+        forms.update({stem + "и", stem + "е", stem + "ю", stem + "ей"})
+    elif name.endswith("ь"):
+        stem = name[:-1]
+        forms.update({stem + "я", stem + "ю", stem + "ем", stem + "е"})
+    else:
+        forms.update({name + "а", name + "у", name + "ом", name + "е"})
     return forms - AMBIGUOUS_FORMS
 
 
@@ -133,10 +155,38 @@ def _build_name_set() -> frozenset[str]:
     names: set[str] = set(MALE_NAMES) | set(FEMALE_NAMES)
     for name in FEMALE_NAMES:
         names |= _female_declensions(name)
+    for name in MALE_NAMES:
+        names |= _male_declensions(name)
     return frozenset(names)
 
 
 FIRST_NAMES: frozenset[str] = _build_name_set()
+
+# Распространённые английские имена: по ним надёжно отличаются имена от названий
+# компаний и продуктов («John Smith» — человек, «Acme Corp» — компания).
+ENGLISH_NAMES: frozenset[str] = frozenset(
+    """
+    john peter michael david james robert william richard charles thomas daniel
+    matthew anthony mark donald steven paul andrew joshua kevin brian george
+    edward ronald timothy jason jeffrey ryan jacob gary nicholas eric stephen
+    jonathan larry justin scott brandon benjamin samuel gregory alexander patrick
+    frank raymond jack dennis jerry tyler aaron jose adam nathan henry douglas
+    zachary kyle ethan jeremy walter christian keith roger terry austin sean
+    gerald carl harold dylan arthur lawrence jordan jesse bryan billy bruce
+    gabriel joe logan alan juan wayne roy ralph randy eugene vincent russell
+    louis philip johnny bobby bradley angelica
+    jennifer linda patricia barbara elizabeth susan jessica sarah karen nancy
+    lisa betty margaret sandra ashley kimberly emily donna michelle carol amanda
+    melissa deborah stephanie rebecca sharon laura cynthia amy shirley angela
+    helen anna brenda pamela nicole ruth katherine samantha christine emma
+    catherine debra virginia rachel carolyn janet maria heather diane julie
+    joyce victoria kelly christina evelyn lauren judith olivia frances martha
+    cheryl megan andrea hannah jacqueline jean alice kathryn gloria teresa
+    doris sara janice julia marie madison grace judy theresa beverly amber
+    marilyn danielle diana brittany natalie sophia rose isabella alexis kayla
+    charlotte
+    """.split()
+)
 
 # Слова, которые не могут быть фамилией в составе ФИО
 NOT_A_SURNAME: frozenset[str] = frozenset(
@@ -228,7 +278,12 @@ def person_parts(full: str) -> tuple[str, str, str]:
             first = part
             break
     if not first:
-        return ("", "", "")
+        # Имя не из нашего лексикона (например, иностранное). Первое слово
+        # считаем именем, второе — фамилией: так обращение всё равно получится
+        # без фамилии.
+        if len(parts) == 1:
+            return (parts[0], "", "")
+        return (parts[0], "", " ".join(parts[1:]))
 
     rest = [part for part in parts if part != first]
     patronymic = ""
@@ -266,26 +321,6 @@ def address_form(full: str) -> str:
     if not first:
         return (full or "").strip()
     return f"{first} {patronymic}".strip()
-
-
-def _male_declensions(name: str) -> set[str]:
-    """Падежные формы мужских имён: Иван -> Ивана, Ивану, Иваном, Иване."""
-    forms: set[str] = set()
-    if name.endswith("й"):
-        stem = name[:-1]
-        forms.update({stem + "я", stem + "ю", stem + "ем", stem + "е"})
-    elif name.endswith("а"):
-        stem = name[:-1]
-        forms.update({stem + "ы", stem + "е", stem + "у", stem + "ой", stem + "ею"})
-    elif name.endswith("я"):
-        stem = name[:-1]
-        forms.update({stem + "и", stem + "е", stem + "ю", stem + "ей"})
-    elif name.endswith("ь"):
-        stem = name[:-1]
-        forms.update({stem + "я", stem + "ю", stem + "ем", stem + "е"})
-    else:
-        forms.update({name + "а", name + "у", name + "ом", name + "е"})
-    return forms - AMBIGUOUS_FORMS
 
 
 def _build_capitalize_names() -> frozenset[str]:
@@ -411,6 +446,21 @@ _PATRONYMIC_RE = re.compile(
     r"(?<![\w-])[А-ЯЁ][а-яё]{2,}(?:ович|евич|овна|евна|ична|инична|ишна)(?![\w-])"
 )
 _SURNAME_RE = re.compile(r"(?<![\w-])[А-ЯЁ][а-яё]{2,}(?![\w-])")
+
+# Латинское имя: первое слово — из словаря английских имён
+_ENGLISH_NAME_RE = re.compile(
+    r"(?<![\w-])(?:" + "|".join(sorted(ENGLISH_NAMES, key=len, reverse=True)) + r")(?![\w-])",
+    re.IGNORECASE,
+)
+
+# Латинская пара «Имя Фамилия» рядом со словами, которые вводят имя
+_NAME_CONTEXT_RE = re.compile(
+    r"(?i)(?:меня\s+зовут|зовут\s+меня|моё\s+имя|мое\s+имя|name\s+is|contact\s+person|"
+    r"обращаться\s+к|пишите\s+мне|подписал|подпись)"
+)
+_LATIN_FULL_NAME_RE = re.compile(
+    r"(?<![\w-])[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})(?![\w-])"
+)
 
 # Фамилия с инициалами: «Иванов И.И.», «И. И. Иванов»
 _SURNAME_INITIALS_RE = re.compile(
@@ -573,12 +623,32 @@ def _find_addresses(text: str) -> list[_Span]:
     return spans
 
 
+# Слова, перед которыми фамилию искать нельзя: иначе «Здравствуйте, Мария»
+# превратится в «[ИМЯ_1] Мария», а «Компания ОфисЛайн» — в «Компания [ИМЯ_1]».
+NOT_A_SURNAME_BEFORE: frozenset[str] = frozenset(
+    """
+    здравствуйте добрый доброе добрые привет спасибо пожалуйста уважаемый уважаемая
+    компания фирма ооо оао зао пао нпо нпк ип тд гк договор счёт счет заявка лид
+    фио имя фамилия отчество имя меня зовут обращайтесь пишите звоните контакт
+    сумма бюджет количество количество штук комплектов
+    """.split()
+)
+
+
 def _find_names(text: str) -> list[_Span]:
     """Имена по лексикону: имя + необязательное отчество + необязательная фамилия."""
     spans: list[_Span] = []
     for match in _FIRST_NAME_RE.finditer(text):
         start = match.start()
         end = match.end()
+
+        # Фамилия перед именем: «Савельева Мария»
+        prefix = text[max(0, start - 40) : start]
+        before = re.search(r"([А-ЯЁ][а-яё]{2,})\s*$", prefix)
+        if before and before.group(1).lower() not in NOT_A_SURNAME_BEFORE:
+            candidate = before.group(1).lower()
+            if candidate not in _city_names() and candidate not in NOT_A_SURNAME:
+                start = max(0, start - 40) + before.start(1)
 
         # Отчество
         tail = text[end : end + 30]
@@ -597,6 +667,36 @@ def _find_names(text: str) -> list[_Span]:
                 end += (len(tail) - len(stripped)) + surname.end()
 
         spans.append(_Span(start, end, "ИМЯ", text[start:end], PRIORITY["ИМЯ"]))
+    return spans
+
+
+def _find_latin_names(text: str) -> list[_Span]:
+    """
+    Латинские имена: «John Smith», «Mary Ann».
+
+    Ловим двумя способами, чтобы не съесть названия компаний:
+    1) первое слово — из словаря распространённых английских имён;
+    2) рядом со словами, которые вводят имя («меня зовут ...»).
+    """
+    spans: list[_Span] = []
+
+    for match in _ENGLISH_NAME_RE.finditer(text):
+        end = match.end()
+        # Дописываем фамилию, если она есть рядом
+        tail = text[end : end + 30]
+        surname = re.match(r"\s+[A-Z][a-z]{1,20}", tail)
+        if surname:
+            end += surname.end()
+        spans.append(_Span(match.start(), end, "ИМЯ", text[match.start() : end], PRIORITY["ИМЯ"]))
+
+    for match in _LATIN_FULL_NAME_RE.finditer(text):
+        prefix = text[max(0, match.start() - 40) : match.start()]
+        if not _NAME_CONTEXT_RE.search(prefix):
+            continue
+        if any(span.start < match.end() and match.start() < span.end for span in spans):
+            continue
+        spans.append(_Span(match.start(), match.end(), "ИМЯ", match.group(0), PRIORITY["ИМЯ"]))
+
     return spans
 
 
@@ -656,7 +756,21 @@ def anonymize(text: str, known_values: Iterable[str] = ()) -> AnonymizationResul
     spans += _find_phones(text)
     spans += _find_addresses(text)
     spans += _find_names(text)
+    spans += _find_latin_names(text)
     spans += _find_surname_with_initials(text)
+
+    # Внутри e-mail или телефона имя не выделяется отдельно: «michael@acme.com» —
+    # это один контакт, а не имя плюс почта.
+    contacts = [span for span in spans if span.kind in ("ПОЧТА", "ТЕЛЕФОН")]
+    if contacts:
+        spans = [
+            span
+            for span in spans
+            if not (
+                span.kind == "ИМЯ"
+                and any(span.start < contact.end and contact.start < span.end for contact in contacts)
+            )
+        ]
 
     accepted = _resolve_overlaps(spans)
 
